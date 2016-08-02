@@ -1,0 +1,2123 @@
+diff -r c3d61d92884b -r bf910786de24 conf/files
+--- a/conf/files	Mon Jun 25 08:23:20 2007 +0900
++++ b/conf/files	Mon Jun 25 14:57:31 2007 +0900
+@@ -1704,6 +1704,7 @@ netinet6/esp_rijndael.c		optional ipsec 
+ netinet6/esp_rijndael.c		optional ipsec ipsec_esp
+ netinet6/frag6.c		optional inet6
+ netinet6/icmp6.c		optional inet6
++netinet6/if_xcst.c		optional xcst inet6 xcast6
+ netinet6/in6.c			optional inet6
+ netinet6/in6_cksum.c		optional inet6
+ netinet6/in6_gif.c		optional gif inet6
+@@ -1731,6 +1732,7 @@ netinet6/scope6.c		optional inet6
+ netinet6/scope6.c		optional inet6
+ netinet6/udp6_output.c		optional inet6
+ netinet6/udp6_usrreq.c		optional inet6
++netinet6/xcast6.c		optional inet6 xcast6
+ netipsec/ipsec.c		optional fast_ipsec
+ netipsec/ipsec_input.c		optional fast_ipsec
+ netipsec/ipsec_mbuf.c		optional fast_ipsec
+diff -r c3d61d92884b -r bf910786de24 conf/options
+--- a/conf/options	Mon Jun 25 08:23:20 2007 +0900
++++ b/conf/options	Mon Jun 25 14:57:31 2007 +0900
+@@ -355,6 +355,7 @@ IPSEC_DEBUG		opt_ipsec.h
+ IPSEC_DEBUG		opt_ipsec.h
+ IPSEC_FILTERGIF		opt_ipsec.h
+ FAST_IPSEC		opt_ipsec.h
++XCAST6			opt_xcast6.h
+ IPDIVERT
+ DUMMYNET		opt_ipdn.h
+ IPFILTER		opt_ipfilter.h
+diff -r c3d61d92884b -r bf910786de24 net/if_types.h
+--- a/net/if_types.h	Mon Jun 25 08:23:20 2007 +0900
++++ b/net/if_types.h	Mon Jun 25 14:57:31 2007 +0900
+@@ -251,4 +251,5 @@
+ #define	IFT_PFSYNC	0xf7
+ #define	IFT_CARP	0xf8	/* Common Address Redundancy Protocol */
+ #define IFT_IPXIP	0xf9
++#define IFT_XCST	0xfa
+ #endif /* !_NET_IF_TYPES_H_ */
+diff -r c3d61d92884b -r bf910786de24 netinet6/if_xcst.c
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/netinet6/if_xcst.c	Mon Jun 25 14:57:31 2007 +0900
+@@ -0,0 +1,879 @@
++/*
++ * Copyright (C) 2001 FUJITSU LABORATRIES LTD.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the project nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#include "opt_inet.h"
++#if defined(__FreeBSD__)
++#include "opt_inet6.h"
++#endif
++#include "opt_xcast6.h"
++#if !defined(__FreeBSD__)
++#include "xcst.h"
++#endif
++#if NXCST > 0 || defined(__FreeBSD__)
++
++#ifndef XCAST6
++#error "need 'options XCAST6' to enable xcst device."
++#endif
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/mbuf.h>
++#include <sys/errno.h>
++#if defined(__NetBSD__)
++#include <sys/ioctl.h>
++#elif defined (__FreeBSD__)
++#include <sys/malloc.h>
++#ifndef M_WAITOK
++#define M_WAITOK	0
++#endif
++#include <sys/module.h>
++#endif
++#include <sys/queue.h>
++#include <sys/time.h>
++#include <sys/syslog.h>
++#include <sys/protosw.h>
++#include <machine/cpu.h>
++
++#include <net/if.h>
++#if defined(__FreeBSD__)
++#include <net/if_clone.h>
++#endif
++#include <net/if_types.h>
++#include <net/netisr.h>
++#include <net/route.h>
++
++#include <netinet/in.h>
++#include <netinet/in_systm.h>
++#ifdef INET
++#include <netinet/ip.h>
++#endif
++#include <netinet/ip_encap.h>
++#ifdef INET6
++#include <netinet/ip6.h>
++#include <netinet6/ip6_var.h>
++#include <netinet6/in6_var.h>
++#include <netinet6/ip6protosw.h>
++#endif
++#include <netinet6/if_xcst.h>
++#include <netinet/ip_ecn.h>
++
++#include <net/net_osdep.h>
++
++#include <machine/stdarg.h>
++
++#ifdef XCAST6
++#include <netinet6/xcast6.h>
++#endif
++
++#if defined(__FreeBSD__)
++#define NBPFILTER	1
++#else
++#include "bpfilter.h"
++#endif
++
++#if NBPFILTER > 0
++#include <net/bpf.h>
++#endif
++
++#define XCST_BASEMTU		(1500 - sizeof(struct ip6_hdr))
++
++#if !defined(__FreeBSD__)
++struct xcst_softc *xcst_softc;
++int xcst_nsoftc;
++#endif
++
++static int xcst_input __P((struct mbuf **, int *, int));
++static int xcst_encapcheck __P((const struct mbuf *, int, int, void *));
++
++#if !defined(__FreeBSD__)
++void	xcstattach __P((int));
++#endif
++static int xcst_output_prebranch __P((struct ifnet *, struct mbuf **,
++				      struct ip6_rthdrx **));
++static int xcst_output_postbranch __P((struct ifnet *, struct mbuf *,
++				       struct xcast6_ctl *));
++static int xcst_output __P((struct ifnet *, struct mbuf *, struct sockaddr *,
++			    struct rtentry *));
++static int xcst_ioctl __P((struct ifnet *, u_long, caddr_t));
++static int xcst_joingroup __P((struct ifnet *));
++static int xcst_addroute __P((struct ifnet *, struct sockaddr *));
++static int xcst_leavegroup __P((struct ifnet *));
++
++#if defined(__FreeBSD__)
++#define XCSTNAME	"xcst"
++
++#if __FreeBSD_version < 700004
++static LIST_HEAD(, xcst_softc) xcst_softc_list;
++#endif
++
++static MALLOC_DEFINE(M_XCST, XCSTNAME, "XCAST6 Interface");
++
++static int xcst_clone_match(struct if_clone *, const char *);
++#if __FreeBSD_version < 700017
++static int xcst_clone_create(struct if_clone *, char *, size_t);
++#else
++static int xcst_clone_create(struct if_clone *, char *, size_t, caddr_t);
++#endif
++static int xcst_clone_destroy(struct if_clone *, struct ifnet *);
++
++#define XCSTUNIT	0
++
++extern struct domain inet6domain;
++struct ip6protosw xcst_protosw =
++{ SOCK_RAW,	&inet6domain,	IPPROTO_IPV6,	PR_ATOMIC|PR_ADDR,
++  xcst_input,	rip6_output,	0,		rip6_ctloutput,
++#if defined(__FreeBSD__)
++  0,
++#else
++  rip6_usrreq,
++#endif
++  0,            0,              0,              0,
++};
++
++/*
++ * All mutable global variables in if_xcst.c are protected by xcst_mtx.
++ * XXXRW: Note that mutable fields in the softc are not currently locked:
++ * in particular, sc_ro needs to be protected from concurrent entrance
++ * of xcst_output().
++ */
++#if __FreeBSD_version < 700004
++static struct mtx xcst_mtx;
++#endif
++
++static char *xcstnames[] = {"xcst0", "xcst", "xcast", NULL};
++
++struct if_clone xcst_cloner = IFC_CLONE_INITIALIZER(XCSTNAME, NULL, 0, NULL,
++    xcst_clone_match, xcst_clone_create, xcst_clone_destroy);
++
++static int
++xcst_clone_match(struct if_clone *ifc, const char *name)
++{
++	int i;
++
++	for(i = 0; xcstnames[i] != NULL; i++) {
++		if (strcmp(xcstnames[i], name) == 0)
++			return 1;
++	}
++
++	return 0;
++}
++
++static int
++#if __FreeBSD_version < 700017
++xcst_clone_create(struct if_clone *ifc, char *name, size_t len)
++#else
++xcst_clone_create(struct if_clone *ifc, char *name, size_t len, caddr_t params)
++#endif
++{
++	struct xcst_softc *sc;
++	struct ifnet *ifp;
++	int err, unit;
++
++	/*
++	 * We can only have one unit, but since unit allocation is
++	 * already locked, we use it to keep from allocating extra
++	 * interfaces.
++	 */
++	unit = XCSTUNIT;
++	if ((err = ifc_alloc_unit(ifc, &unit)) != 0)
++		return err;
++
++	sc = malloc(sizeof(struct xcst_softc), M_XCST, M_WAITOK | M_ZERO);
++#if __FreeBSD_version < 600031
++	ifp = XCST2IFP(sc);
++#else
++	ifp = XCST2IFP(sc) = if_alloc(IFT_XCST);
++	if (ifp == NULL) {
++		free(sc, M_XCST);
++		ifc_free_unit(ifc, unit);
++		return (ENOSPC);
++	}
++#endif
++	/*
++	 * Set the name manually rather then using if_initname because
++	 * we don't conform to the default naming convention for interfaces.
++	 */
++	strlcpy(ifp->if_xname, name, IFNAMSIZ);
++	ifp->if_dname = ifc->ifc_name;
++	ifp->if_dunit = IF_DUNIT_NONE;
++
++	sc->sc_cookie = encap_attach_func(AF_INET6, -1,
++	    xcst_encapcheck, (struct protosw *)(void *)&xcst_protosw, sc);
++	if (sc->sc_cookie == NULL) {
++		if_printf(ifp, "attach failed\n");
++		free(sc, M_XCST);
++		ifc_free_unit(ifc, unit);
++		return ENOMEM;
++	}
++
++	ifp->if_softc = sc;
++#if __FreeBSD_version < 600031
++	ifp->if_type = IFT_XCST;
++#endif
++	ifp->if_snd.ifq_maxlen = IFQ_MAXLEN;
++	ifp->if_flags = IFF_MULTICAST;
++	ifp->if_output = xcst_output;
++	ifp->if_ioctl = xcst_ioctl;
++	ifp->if_mtu = XCST_BASEMTU;
++
++	if_attach(ifp);
++	bpfattach(ifp, DLT_NULL, ifp->if_hdrlen);
++
++#if __FreeBSD_version < 700004
++	mtx_lock(&xcst_mtx);
++	LIST_INSERT_HEAD(&xcst_softc_list, sc, sc_list);
++	mtx_unlock(&xcst_mtx);
++#endif
++	return 0;
++}
++
++#if __FreeBSD_version < 700003
++static void
++xcst_destroy(struct xcst_softc *sc)
++{
++	int err;
++
++	err = encap_detach(sc->sc_cookie);
++	KASSERT(err == 0, ("Unexpected error detaching encap_cookie"));
++	bpfdetach(XCST2IFP(sc));
++	if_detach(XCST2IFP(sc));
++#if __FreeBSD_version >= 600031
++	if_free(XCST2IFP(sc));
++#endif
++
++	free(sc, M_XCST);
++}
++#endif
++
++static int
++xcst_clone_destroy(struct if_clone *ifc, struct ifnet *ifp)
++{
++	struct xcst_softc *sc = ifp->if_softc;
++#if __FreeBSD_version >= 700003
++	int err;
++#endif
++
++#if __FreeBSD_version < 700004
++	mtx_lock(&xcst_mtx);
++	LIST_REMOVE(sc, sc_list);
++	mtx_unlock(&xcst_mtx);
++#endif
++
++#if __FreeBSD_version < 700003
++	xcst_destroy(sc);
++#else
++	err = encap_detach(sc->sc_cookie);
++	KASSERT(err == 0, ("Unexpected error detaching encap_cookie"));
++	bpfdetach(ifp);
++	if_detach(ifp);
++	if_free(ifp);
++
++	free(sc, M_XCST);
++#endif
++	ifc_free_unit(ifc, XCSTUNIT);
++
++	return 0;
++}
++
++static int
++xcst_modevent(module_t mod, int type, void *data)
++{
++#if __FreeBSD_version < 700004
++	struct xcst_softc *sc;
++#endif
++
++	switch (type) {
++	case MOD_LOAD:
++#if __FreeBSD_version < 700004
++		mtx_init(&xcst_mtx, "xcst_mtx", NULL, MTX_DEF);
++		LIST_INIT(&xcst_softc_list);
++#endif
++		if_clone_attach(&xcst_cloner);
++		break;
++	case MOD_UNLOAD:
++		if_clone_detach(&xcst_cloner);
++#if __FreeBSD_version < 700004
++		mtx_lock(&xcst_mtx);
++		while ((sc = LIST_FIRST(&xcst_softc_list)) != NULL) {
++#if __FreeBSD_version < 700003
++			LIST_REMOVE(sc, sc_list);
++			mtx_unlock(&xcst_mtx);
++			xcst_destroy(sc);
++#else
++			mtx_unlock(&xcst_mtx);
++			xcst_clone_destroy(&xcst_cloner, XCST2IFP(sc));
++#endif
++			mtx_lock(&xcst_mtx);
++		}
++		mtx_unlock(&xcst_mtx);
++		mtx_destroy(&xcst_mtx);
++#endif
++		break;
++	default:
++		return EOPNOTSUPP;
++	}
++	return 0;
++}
++
++static moduledata_t xcst_mod = {
++	"if_xcst",
++	xcst_modevent,
++	0
++};
++
++DECLARE_MODULE(if_xcst, xcst_mod, SI_SUB_PSEUDO, SI_ORDER_ANY);
++
++#else /* __FreeBSD__ */
++
++void
++xcstattach(count)
++	int count;
++{
++	struct xcst_softc *sc;
++	size_t size;
++	int i;
++
++	xcst_nsoftc = count;
++	size = sizeof(struct xcst_softc) * count;
++	xcst_softc = malloc(size, M_DEVBUF, M_WAITOK);
++	memset(xcst_softc, 0, size);
++
++	for (i = 0; i < count; i++) {
++		sc = &xcst_softc[i];
++
++		sprintf(sc->sc_if.if_xname, "xcst%d", i);
++
++		sc->sc_cookie = encap_attach_func(AF_INET6, -1,
++		    xcst_encapcheck, (struct protosw *)&xcst_protosw, sc);
++		if (sc->sc_cookie == NULL) {
++			printf("%s: attach failed\n", sc->sc_if.if_xname);
++			continue;
++		}
++
++		sc->sc_if.if_softc = sc;
++		sc->sc_if.if_type = IFT_XCST;
++#if defined(__NetBSD__)
++		sc->sc_if.if_dlt = DLT_NULL;
++#endif
++		sc->sc_if.if_flags = IFF_MULTICAST;
++		sc->sc_if.if_output = xcst_output;
++		sc->sc_if.if_ioctl = xcst_ioctl;
++		sc->sc_if.if_mtu = XCST_BASEMTU;
++
++		if_attach(&sc->sc_if);
++#if defined(__NetBSD__)
++		if_alloc_sadl(&sc->sc_if);
++#endif
++#if NBPFILTER > 0
++		bpfattach(&sc->sc_if, DLT_NULL, sc->sc_if.if_hdrlen);
++#endif
++	}
++}
++#endif /* __FreeBSD__ */
++
++static int
++xcst_input(mp, offp, proto)
++	struct mbuf **mp;
++	int *offp;
++	int proto;
++{
++	struct mbuf *m = *mp;
++	struct xcst_softc *sc;
++	struct xcast6_ctl *ctl;
++	struct ip6_hdr *ip6;
++	struct ifnet *ifp;
++	int off = *offp;
++	int hlim;
++
++	/*
++	 * No need to check xcast6_enable here since xcst_encapcheck() do not
++	 * return positive value on xcast_enable == 0.
++	 */
++	sc = (struct xcst_softc *)encap_getarg(m);
++	if (sc == NULL) {
++		m_freem(m);
++		return IPPROTO_DONE;
++	}
++
++	if ((ctl = xcast6_addctl(m)) == NULL) {
++		m_freem(m);
++		return IPPROTO_DONE;
++	}
++
++	ifp = XCST2IFP(sc);
++	ip6 = mtod(m, struct ip6_hdr *);
++	hlim = ip6->ip6_hlim;
++
++	/* Outer IPv6 headr has been checked by xcst_encapcheck().  Skip. */
++	m_adj(m, off);
++
++	off = sizeof(struct ip6_hdr);
++	if (m->m_len < off) {
++		if ((m = m_pullup(m, off)) == NULL)
++			return IPPROTO_DONE;
++	}
++
++	/* Check for inner IPv6 header. */
++	ip6 = mtod(m, struct ip6_hdr *);
++	if (!xcast6_is_addr_xcast6(&ip6->ip6_dst))
++		goto err;
++
++	/*
++	 * Next header should be the (XCAST6) routing header.
++	 * This check might cause problems in the future...
++	 */
++	if (ip6->ip6_nxt != IPPROTO_ROUTING)
++		goto err;
++
++	ctl->xc6_hlim = hlim;
++	m->m_pkthdr.rcvif = ifp;
++
++#if NBPFILTER > 0
++#if !defined(__FreeBSD__) || __FreeBSD_version < 700017
++	if (ifp->if_bpf)
++#else
++	if (bpf_peers_present(ifp->if_bpf))
++#endif
++	{
++		/*
++		 * We need to prepend the address family as
++		 * a four byte field.  Cons up a dummy header
++		 * to pacify bpf.  This is safe because bpf
++		 * will only read from the mbuf (i.e., it won't
++		 * try to free it or keep a pointer a to it).
++		 */
++		u_int32_t af = AF_INET6;
++#if defined(__FreeBSD__)
++		bpf_mtap2(ifp->if_bpf, &af, sizeof(af), m);
++#else
++		struct mbuf m0;
++
++		(void)memset(&m0, 0, sizeof(m0));
++		m0.m_next = m;
++		m0.m_len = 4;
++		m0.m_data = (char *)&af;
++
++		bpf_mtap(ifp->if_bpf, &m0);
++#endif
++	}
++#endif
++
++	ifp->if_ipackets++;
++	ifp->if_ibytes += m->m_pkthdr.len;
++	netisr_dispatch(NETISR_IPV6, m);
++	return IPPROTO_DONE;
++err:
++	ifp->if_ierrors++;
++	m_freem(m);
++	return IPPROTO_DONE;
++}
++
++static int
++xcst_output_prebranch(ifp, mp, ip6rxp)
++	struct ifnet *ifp;
++	struct mbuf **mp;
++	struct ip6_rthdrx **ip6rxp;
++{
++	struct mbuf *m = *mp;
++	struct ip6_hdr *ip6;
++	struct ip6_rthdr *ip6r;
++	struct ip6_rthdrx *ip6rx;
++	struct xcast6_ctl *ctl;
++	int off;
++	int hlim;
++#ifndef PULLDOWN_TEST
++	struct mbuf *n;
++#endif
++
++	ip6 = mtod(m, struct ip6_hdr *);
++
++	if (!xcast6_is_addr_xcast6(&ip6->ip6_dst))
++		return EINVAL;
++
++	if (ip6->ip6_nxt != IPPROTO_ROUTING)
++		return EINVAL;
++
++	hlim = ip6->ip6_hlim;
++	off = sizeof(*ip6);
++#ifndef PULLDOWN_TEST
++	if (m->m_len < off + sizeof(*ip6r)) {
++		m = m_pullup(m, off + sizeof(*ip6r));
++		if (m == NULL)
++			return ENOBUFS;
++	}
++
++	if (m->m_next != NULL && m->m_pkthdr.len < MCLBYTES) {
++		MGETHDR(n, M_DONTWAIT, MT_HEADER);
++		if (n == NULL) {
++			m_freem(m);
++			return ENOBUFS;
++		}
++		M_MOVE_PKTHDR(n, m);
++		if (n->m_pkthdr.len > MHLEN) {
++			MCLGET(n, M_DONTWAIT);
++			if ((n->m_flags & M_EXT) == 0) {
++				m_freem(n);
++				m_freem(m);
++				return ENOBUFS;
++			}
++		}
++		m_copydata(m, 0, n->m_pkthdr.len, mtod(n, caddr_t));
++		n->m_len = n->m_pkthdr.len;
++		m_freem(m);
++		m = n;
++	}
++
++	ip6r = (struct ip6_rthdr *)(mtod(m, u_int8_t *) + off);
++	if (ip6r->ip6r_type != IPV6_RTHDR_TYPE_XCAST6) {
++		m_freem(m);
++		return EINVAL;
++	}
++
++	if (m->m_len < off + ((ip6r->ip6r_len + 1) << 3)) {
++		m = m_pullup(m, off + ((ip6r->ip6r_len + 1) << 3));
++		if (m == NULL)
++			return ENOBUFS;
++	}
++
++	ip6rx = (struct ip6_rthdrx *)(mtod(m, u_int8_t *) + off);
++#else
++	IP6_EXTHDR_GET(ip6r, struct ip6_rthdr *, m, off, sizeof(*ip6r));
++	if (ip6r == NULL) {
++		ip6stat.ip6s_toosmall++;
++		in6_ifstat_inc(ifp, ifs6_in_hdrerr);
++		return EINVAL;
++	}
++
++	IP6_EXTHDR_GET(ip6rx, struct ip6_rthdrx *, m, off,
++		       (ip6r->ip6r_len + 1) << 3);
++	if (ip6rx == NULL) {
++		ip6stat.ip6s_toosmall++;
++		in6_ifstat_inc(ifp, ifs6_in_hdrerr);
++		return EINVAL;
++	}
++#endif
++
++#if NBPFILTER > 0
++#if !defined(__FreeBSD__) || __FreeBSD_version < 700017
++	if (ifp->if_bpf)
++#else
++	if (bpf_peers_present(ifp->if_bpf))
++#endif
++	{
++		/*
++		 * We need to prepend the address family as
++		 * a four byte field.  Cons up a dummy header
++		 * to pacify bpf.  This is safe because bpf
++		 * will only read from the mbuf (i.e., it won't
++		 * try to free it or keep a pointer a to it).
++		 */
++		u_int32_t af = AF_INET6;
++#if defined(__FreeBSD__)
++		bpf_mtap2(ifp->if_bpf, &af, sizeof(af), m);
++#else
++		struct mbuf m0;
++
++		(void)memset(&m0, 0, sizeof(m0));
++		m0.m_next = m;
++		m0.m_len = 4;
++		m0.m_data = (char *)&af;
++		bpf_mtap(ifp->if_bpf, &m0);
++#endif
++	}
++#endif
++
++	if ((ctl = xcast6_addctl(m)) == NULL) {
++		m_freem(m);
++		return ENOBUFS;
++	}
++
++	ctl->xc6_hlim = hlim;
++	*mp = m;
++	*ip6rxp = ip6rx;
++	ifp->if_opackets++;
++	ifp->if_obytes += m->m_pkthdr.len;
++
++	return 0;
++	
++}
++
++static int
++xcst_output_postbranch(ifp, m, ctl)
++	struct ifnet *ifp;
++	struct mbuf *m;
++	struct xcast6_ctl *ctl;
++{
++	struct sockaddr_in6 sin6;
++	struct ip6_hdr *ip6;
++	struct in6_addr *src;
++	int err;
++	u_int8_t hlim;
++
++	ip6 = mtod(m, struct ip6_hdr *);
++	hlim = ctl->xc6_hlim;
++	if (hlim == 0)
++		hlim = ip6->ip6_hlim;
++
++	ip6->ip6_hlim = 1;
++
++	memset(&sin6, 0, sizeof(sin6));
++	sin6.sin6_len = sizeof(sin6);
++	sin6.sin6_family = AF_INET6;
++	sin6.sin6_addr = ctl->xc6_dst;
++	src = in6_selectsrc(&sin6, NULL, NULL, NULL, NULL, NULL, &err);
++	if (src == NULL)
++		return err;
++
++	/* Prepend for outer IPv6 header */
++	M_PREPEND(m, sizeof(*ip6), M_DONTWAIT);
++	if (m == NULL)
++		return ENOBUFS;
++
++	ip6 = mtod(m, struct ip6_hdr *);
++	ip6->ip6_flow = XCAST6_FLOWINFO;
++	ip6->ip6_vfc &= ~IPV6_VERSION_MASK;
++	ip6->ip6_vfc |= IPV6_VERSION;
++
++	ip6->ip6_plen = htons((u_short)m->m_pkthdr.len);
++	ip6->ip6_nxt = IPPROTO_IPV6;
++	ip6->ip6_hlim = hlim;
++	ip6->ip6_src = *src;
++	ip6->ip6_dst = ctl->xc6_dst;
++
++	return ip6_output(m, NULL, NULL, 0, NULL, NULL, NULL);
++}
++
++/*
++ * Output routine. xcst_output will not be called on forwarding.
++ */
++static int
++xcst_output(ifp, m0, dst, rt)
++	struct ifnet *ifp;
++	struct mbuf *m0;
++	struct sockaddr *dst;
++	struct rtentry *rt;
++{
++	struct xcast6_ctl *ctl;
++	struct mbuf *m = m0;
++	int ret;
++	struct ip6_rthdrx *ip6rx;
++	int off;
++
++	if (dst->sa_family != AF_INET6) {
++#if defined(__FreeBSD__)
++		_IF_DROP(&ifp->if_snd);
++#else
++		IF_DROP(&ifp->if_snd);
++#endif
++		m_freem(m);
++		return EAFNOSUPPORT;
++	}
++
++	if ((ctl = xcast6_getctl(m)) != NULL) {
++		/* xcast6_branch() -> ip6_output() -> ... -> xcst_output() */
++		ret = xcst_output_postbranch(ifp, m, ctl);
++	} else {
++		/* packets sent by us not branched yet. */
++		ret = xcst_output_prebranch(ifp, &m, &ip6rx);
++		if (ret)
++			return ret;
++
++		m->m_pkthdr.rcvif = ifp;	/* XXX hack for loopback */
++		off = sizeof(struct ip6_hdr);
++		ret = xcast6_branch(m, ip6rx, &off, -1);
++		if (ret < 0) {
++			return 0;
++		} else if (ret == 0) {
++			/* contains local destination */
++			ip6_input(m);
++		}
++	}
++
++	return ret;
++}
++
++static int
++xcst_joingroup(ifp)
++     struct ifnet *ifp;
++{
++	struct xcst_softc *sc = ifp->if_softc;
++	int error = 0;
++
++	if (sc->sc_group != NULL)
++		return 0;
++
++	sc->sc_group = in6_joingroup(ifp, &in6addr_all_xcast6, &error, 0);
++
++	return error;
++}
++
++static int
++xcst_leavegroup(ifp)
++     struct ifnet *ifp;
++{
++	struct xcst_softc *sc = ifp->if_softc;
++	struct in6_multi_mship *in6m;
++
++	if (sc->sc_group == NULL)
++		return 0;
++
++	in6m = sc->sc_group;
++	sc->sc_group = NULL;
++
++	return in6_leavegroup(in6m);
++}
++
++static int
++xcst_addroute(ifp, sa)
++     struct ifnet *ifp;
++     struct sockaddr *sa;
++{
++	struct sockaddr_in6 addr, mask;
++	struct rtentry *rt;
++	int error = 0;
++
++	bzero(&addr, sizeof(addr));
++	addr.sin6_len = sizeof(addr);
++	addr.sin6_family = AF_INET6;
++	addr.sin6_addr = in6addr_all_xcast6;
++
++	bzero(&mask, sizeof(mask));
++	mask.sin6_len = sizeof(mask);
++	mask.sin6_family = AF_INET6;
++	mask.sin6_addr = in6mask128;
++
++	rt = rtalloc1((struct sockaddr *)&addr, 0, 0UL);
++	if (rt != NULL) {
++		if (memcmp(&in6mask128,
++			   &((struct sockaddr_in6 *)rt_key(rt))->sin6_addr,
++			   sizeof(in6mask128))) {
++			RTFREE_LOCKED(rt);
++			rt = NULL;
++		}
++	}
++
++	if (rt != NULL) {
++		RTFREE_LOCKED(rt);
++		goto out;
++	}
++
++	error = rtrequest(RTM_ADD,
++			  (struct sockaddr *)&addr,
++			  sa,
++			  (struct sockaddr *)&mask,
++			  RTF_UP | RTF_HOST,
++			  (struct rtentry **)0);
++out:
++	return error;
++}
++
++static int
++xcst_ioctl(ifp, cmd, data)
++	struct ifnet *ifp;
++	u_long cmd;
++	caddr_t data;
++{
++	struct ifreq *ifr = (struct ifreq *)data;
++	struct ifaddr *ifa = (struct ifaddr *)data;
++	int s, error = 0;
++
++	s = splnet();
++
++	/* XXX TODO: install routing record for ff0e::114 automatically */
++	switch (cmd) {
++	case SIOCSIFADDR:
++		if (ifa == NULL || ifa->ifa_addr->sa_family != AF_INET6) {
++			error = EAFNOSUPPORT;
++			break;
++		}
++		error = xcst_addroute(ifp, ifa->ifa_addr);
++		break;
++
++	case SIOCSIFFLAGS:
++		if ((ifp->if_flags & IFF_UP) != 0)
++			xcst_joingroup(ifp);
++		else
++			xcst_leavegroup(ifp);
++		break;
++
++	case SIOCSIFMTU:
++		break;
++
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		if (ifr == NULL || ifr->ifr_addr.sa_family != AF_INET6)
++			error = EAFNOSUPPORT;
++		break;
++
++	default:
++		error = EINVAL;
++	}
++
++	splx(s);
++	return (error);
++}
++
++static int
++xcst_encapcheck(m, off, proto, arg)
++	const struct mbuf *m;
++	int off;
++	int proto;
++	void *arg;
++{
++	struct xcst_softc *sc;
++	struct ip6_hdr *ip6;
++
++	sc = (struct xcst_softc *)arg;
++	if (sc == NULL)
++		return 0;
++
++	if ((XCST2IFP(sc)->if_flags & IFF_UP) == 0)
++		return 0;
++
++	if (!xcast6_enable)
++		return 0;
++
++	if (proto != IPPROTO_IPV6)
++		return 0;
++
++	ip6 = mtod(m, struct ip6_hdr *);
++	/* Do not allow extension headers between outer and inner...  */
++	if (ip6->ip6_nxt != IPPROTO_IPV6)
++		return 0;
++
++	if ((ip6->ip6_flow & IPV6_FLOWINFO_MASK) != XCAST6_FLOWINFO)
++		return 0;
++
++	return (sizeof(u_int32_t) + sizeof(u_int8_t)) * 8;
++}
++
++#endif /* NXCST > 0 */
+diff -r c3d61d92884b -r bf910786de24 netinet6/if_xcst.h
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/netinet6/if_xcst.h	Mon Jun 25 14:57:31 2007 +0900
+@@ -0,0 +1,58 @@
++/*
++ * Copyright (C) 2001 FUJITSU LABORATRIES LTD.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the project nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#ifndef _NETINET6_IF_XCST_H_
++#define	_NETINET6_IF_XCST_H_
++
++struct encaptab;
++
++struct xcst_softc {
++#if !defined(__FreeBSD__) || __FreeBSD_version < 600031
++	struct ifnet sc_if;		/* our ifnet structure */
++#else
++	struct ifnet *sc_ifp;		/* our ifnet structure */
++#endif
++	const struct encaptab *sc_cookie;
++	struct in6_multi_mship *sc_group;
++#if defined(__FreeBSD__)
++#if __FreeBSD_version < 501113
++	struct resource *r_unit;	/* resource allocated for this unit */
++#endif
++#if __FreeBSD_version < 700004
++	LIST_ENTRY(xcst_softc) sc_list;	/* all xcst's are linked */
++#endif
++#endif
++};
++#if !defined(__FreeBSD__) || __FreeBSD_version < 600031
++#define XCST2IFP(sc)	(&(sc)->sc_if)
++#else
++#define XCST2IFP(sc)	((sc)->sc_ifp)
++#endif
++
++#endif /* _NETINET6_IF_XCST_H_ */
+diff -r c3d61d92884b -r bf910786de24 netinet6/ip6_input.c
+--- a/netinet6/ip6_input.c	Mon Jun 25 08:23:20 2007 +0900
++++ b/netinet6/ip6_input.c	Mon Jun 25 14:57:31 2007 +0900
+@@ -65,6 +65,7 @@
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
+ #include "opt_ipsec.h"
++#include "opt_xcast6.h"
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -114,6 +115,10 @@
+ #include <netipsec/ipsec6.h>
+ #define	IPSEC
+ #endif /* FAST_IPSEC */
++
++#ifdef XCAST6
++#include <netinet6/xcast6.h>
++#endif
+ 
+ #include <netinet6/ip6_fw.h>
+ 
+@@ -595,6 +600,18 @@ passin:
+ 			goto hbhcheck;
+ 		}
+ 	}
++
++#ifdef XCAST6
++	if (xcast6_enable) {
++		if ((ip6->ip6_flow & IPV6_FLOWINFO_MASK) == XCAST6_FLOWINFO &&
++		    ip6->ip6_nxt == IPPROTO_IPV6) {
++			/* XCAST6 packet (probably) */
++			ours = 1;
++			deliverifp = ip6_forward_rt.ro_rt->rt_ifp;
++			goto hbhcheck;
++		}
++	}
++#endif
+ 
+ 	/*
+ 	 * Now there is no reason to process the packet if it's not our own
+diff -r c3d61d92884b -r bf910786de24 netinet6/ip6_output.c
+--- a/netinet6/ip6_output.c	Mon Jun 25 08:23:20 2007 +0900
++++ b/netinet6/ip6_output.c	Mon Jun 25 14:57:31 2007 +0900
+@@ -65,6 +65,7 @@
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
+ #include "opt_ipsec.h"
++#include "opt_xcast6.h"
+ 
+ #include <sys/param.h>
+ #include <sys/malloc.h>
+@@ -105,6 +106,10 @@
+ #include <netipsec/ipsec6.h>
+ #include <netipsec/key.h>
+ #endif /* FAST_IPSEC */
++
++#ifdef XCAST6
++#include <netinet6/xcast6.h>
++#endif
+ 
+ #include <netinet6/ip6_fw.h>
+ 
+@@ -517,6 +522,16 @@ skip_ipsec2:;
+ 			 /* XXX */
+ 			 in6_clearscope(addr + rh0->ip6r0_segleft - 1);
+ 			 break;
++#ifdef XCAST6
++		case IPV6_RTHDR_TYPE_XCAST6:
++			if (!xcast6_enable) {
++				error = EINVAL;
++				goto bad;
++			}
++
++			/* No need to process the routing header here. */
++			break;
++#endif
+ 		default:	/* is it possible? */
+ 			 error = EINVAL;
+ 			 goto bad;
+@@ -3334,6 +3349,18 @@ ip6_setpktopt(optname, buf, len, opt, pr
+ 			if (rth->ip6r_len / 2 != rth->ip6r_segleft)
+ 				return (EINVAL);
+ 			break;
++#ifdef XCAST6
++		case IPV6_RTHDR_TYPE_XCAST6:
++			if (!xcast6_enable)
++				return (EINVAL);
++			if (rth->ip6r_len < 2)	/* must contain one addr */
++				return (EINVAL);
++			if (rth->ip6r_len % 2)	/* length must be even */
++				return (EINVAL);
++			if (rth->ip6r_segleft != 0) /* segleft must be 0 */
++				return (EINVAL);
++			break;
++#endif
+ 		default:
+ 			return (EINVAL);	/* not supported */
+ 		}
+diff -r c3d61d92884b -r bf910786de24 netinet6/route6.c
+--- a/netinet6/route6.c	Mon Jun 25 08:23:20 2007 +0900
++++ b/netinet6/route6.c	Mon Jun 25 14:57:31 2007 +0900
+@@ -32,6 +32,7 @@
+ 
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
++#include "opt_xcast6.h"
+ 
+ #include <sys/param.h>
+ #include <sys/mbuf.h>
+@@ -46,6 +47,10 @@
+ #include <netinet/ip6.h>
+ #include <netinet6/ip6_var.h>
+ #include <netinet6/scope6_var.h>
++
++#ifdef XCAST6
++#include <netinet6/xcast6.h>
++#endif
+ 
+ #include <netinet/icmp6.h>
+ 
+@@ -114,6 +119,43 @@ route6_input(mp, offp, proto)
+ 		if (ip6_rthdr0(m, ip6, (struct ip6_rthdr0 *)rh))
+ 			return (IPPROTO_DONE);
+ 		break;
++#ifdef XCAST6
++	case IPV6_RTHDR_TYPE_XCAST6: {
++		struct xcast6_ctl *ctl;
++		int ret;
++
++		if (!xcast6_enable)
++			goto fakeunknown;
++
++		rhlen = (rh->ip6r_len + 1) << 3;
++
++#ifndef PULLDOWN_TEST
++		/* Copied from TYPE_0. See comments on TYPE_0. */
++		IP6_EXTHDR_CHECK(m, off, rhlen, IPPROTO_DONE);
++#else
++		/* Copied from TYPE_0. See comments on TYPE_0. */
++		IP6_EXTHDR_GET(rh, struct ip6_rthdr *, m, off, rhlen);
++		if (rh == NULL) {
++			ip6stat.ip6s_tooshort++;
++			return IPPROTO_DONE;
++		}
++#endif
++		ctl = xcast6_getctl(m);
++		if (ctl == NULL) {
++			/* no XCAST6 flow ID in outer IPv6 header */
++			return IPPROTO_DONE;
++		}
++
++		ret = xcast6_branch(m, (struct ip6_rthdrx *)rh, offp,
++				    ctl->xc6_hlim);
++		if (ret == 0)
++			break;
++
++		return IPPROTO_DONE;
++fakeunknown:
++		; /*FALLTHRU*/
++	}
++#endif /* XCAST6 */
+ 	default:
+ 		/* unknown routing type */
+ 		if (rh->ip6r_segleft == 0) {
+diff -r c3d61d92884b -r bf910786de24 netinet6/xcast6.c
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/netinet6/xcast6.c	Mon Jun 25 14:57:31 2007 +0900
+@@ -0,0 +1,888 @@
++/*
++ * Copyright (C) 2001 FUJITSU LABORATRIES LTD.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the project nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#include "opt_inet.h"
++#include "opt_xcast6.h"
++
++#include <sys/param.h>
++#include <sys/mbuf.h>
++#include <sys/socket.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/queue.h>
++#include <sys/syslog.h>
++#if defined(__FreeBSD__)
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#ifndef M_DONTWAIT
++#define M_DONTWAIT	M_NOWAIT
++#endif
++#endif
++
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/route.h>
++#include <netinet/in.h>
++#include <netinet6/in6_var.h>
++#include <netinet/ip6.h>
++#include <netinet/icmp6.h>
++#include <netinet6/ip6_var.h>
++#include <netinet6/ip6protosw.h>
++#include <netinet6/nd6.h>
++#include <netinet6/xcast6.h>
++
++#if defined(PACKET_TAG_NONE)
++#define USE_M_TAG
++#endif
++
++static int xcast6_bit_find __P((u_int8_t *, int, int));
++static struct mbuf *xcast6_copym0 __P((struct mbuf *, int));
++static struct mbuf *xcast6_dupm __P((struct mbuf *));
++static int xcast6_forward __P((struct mbuf *, int));
++static struct mbuf *xcast6_setup_rthdr __P((struct mbuf *m, int,
++					    struct ip6_rthdrx *,
++					    u_int8_t *,
++					    struct in6_addr *,
++					    struct in6_addr *,
++					    int));
++static int xcast6_is_same_route __P((struct rtentry *, struct rtentry *));
++static int xcast6_is_same_gateway __P((struct rtentry *, struct rtentry *));
++static int xcast6_x2u_forward __P((struct mbuf *, struct in6_addr *,
++				   struct rtentry *, int, int, int));
++static int xcast6_can_x2u __P((struct mbuf *, int, struct ip6_rthdrx *));
++static void xcast6_free_routes __P((struct rtentry **, u_int8_t *, int));
++#ifndef USE_M_TAG
++static void m_aux_putoff __P((struct mbuf *, struct mbuf *));
++#endif
++
++#define xcast6_bit_set(bm, pos) \
++	((bm)[(pos) >> 3] |= (1 << ((pos) & 7)))
++
++#define xcast6_bit_clear(bm, pos) \
++	((bm)[(pos) >> 3] &= ~(1 << ((pos) & 7)))
++
++#define xcast6_bit_test(bm, pos) \
++	((bm)[(pos) >> 3] & (1 << ((pos) & 7)))
++
++int xcast6_enable = 1;
++int xcast6_x2u = 0;
++
++struct in6_addr in6addr_all_xcast6 = IN6ADDR_ALLXCASTNODES_INIT;
++
++static int
++xcast6_bit_find(bm, off, len)
++	u_int8_t *bm;
++	int off;
++	int len;
++{
++	register int i;
++	int base = off / 8;
++	int stop = (len + 7) / 8;
++
++        for (i = base; i < stop; i++) {
++		register int s, b, j;
++		int ret;
++
++		b = bm[i];
++		if (b == 0)
++			continue;
++
++		if (i == base)
++			j = off & 7;
++		else
++			j = 0;
++
++		for (s = (1 << j); j < 8; s <<= 1, j++) {
++			ret = i * 8 + j;
++			if (ret >= len)
++				return -1;
++			if ((b & s) != 0)
++				return ret;
++		}
++	}
++	return -1;
++}
++
++int
++xcast6_branch(m, rthx, offp, hlim)
++	struct mbuf *m;
++	struct ip6_rthdrx *rthx;
++	int *offp;
++	int hlim;
++{
++	int (*issamef)(struct rtentry *, struct rtentry *);
++	struct rtentry **routetab, *rbase, *r;
++	u_int8_t bm[XCAST6_DMAP_LEN], bmrest[XCAST6_DMAP_LEN];
++	struct xcast6_ctl *ctl;
++	struct sockaddr_in6 sin6;
++	struct in6_addr *dsts;
++	struct mbuf *nm;
++	u_int8_t *bp;
++	int i, j;
++	int is_direct;
++	int can_x2u;
++	int rests, local, ndest, branch, acnt;
++
++	/* Check the header */
++
++	if (rthx->ip6rx_type != IPV6_RTHDR_TYPE_XCAST6) {
++		ip6stat.ip6s_badoptions++;
++		m_freem(m);
++		return EINVAL;
++	}
++
++	bp = rthx->ip6rx_dmap;
++	ndest = rthx->ip6rx_ndest;
++	dsts = (struct in6_addr *)(rthx + 1);
++
++	ctl = xcast6_getctl(m);
++	if (ctl == NULL) {
++		m_freem(m);
++		return EINVAL;
++	}
++
++	if (ctl->xc6_branched) {
++		/* already branched.  loopback packet. */
++		return 0;
++	}
++	ctl->xc6_branched++;
++		
++	bzero(&sin6, sizeof(sin6));
++	sin6.sin6_len = sizeof(sin6);
++	sin6.sin6_family = AF_INET6;
++
++	routetab = malloc(ndest * sizeof(*routetab), M_TEMP, M_NOWAIT);
++	if (routetab == NULL) {
++		m_freem(m);
++		return ENOBUFS;
++	}
++
++	/* 
++	 * Drop multicast bits.  IP6 destination is a multicast address,
++	 * but should be unicasted in link layer.
++	 */
++	m->m_flags &= ~(M_MCAST|M_BCAST);
++
++	can_x2u = xcast6_can_x2u(m, *offp, rthx);
++	/* XXX must check ANON bit */
++
++	/* Lookup each route for destinations. */
++	i = 0;
++	rests = 0;
++	bcopy(bp, bmrest, sizeof(bmrest));
++	while ((i = xcast6_bit_find(bmrest, i, ndest)) >= 0) {
++		/*
++		 * Drop packets if the address list contains multicast,
++		 * link-local, or site-local address(es).
++		 * Also drop packets coming from foreign nodes
++		 * if the address list contains loopback address(es)
++		 */
++		if (IN6_IS_ADDR_MULTICAST(&dsts[i]) ||
++		    IN6_IS_ADDR_LINKLOCAL(&dsts[i])) {
++			xcast6_free_routes(routetab, bmrest, i);
++			rests = 0;
++			break;
++		} else if (IN6_IS_ADDR_SITELOCAL(&dsts[i])) {
++			xcast6_free_routes(routetab, bmrest, i);
++			rests = 0;
++			break;
++		} else if (IN6_IS_ADDR_LOOPBACK(&dsts[i])) {
++			xcast6_free_routes(routetab, bmrest, i);
++			rests = 0;
++			break;
++		}
++
++		sin6.sin6_addr = dsts[i];
++		r = routetab[i] = rtalloc1((struct sockaddr *)&sin6, 1, 0UL);
++		/* Early check. Don't forward if destination unreachable */
++		if (r == NULL) {
++			xcast6_bit_clear(bmrest, i);
++		} else if ((r->rt_flags & RTF_UP) == 0) {
++			xcast6_bit_clear(bmrest, i);
++#if defined(__FreeBSD__) && __FreeBSD_version >= 501113
++			RTFREE(r);
++#else
++			rtfree(r);
++#endif
++		} else {
++#if defined(__FreeBSD__) && __FreeBSD_version >= 501113
++			RT_UNLOCK(r);
++#endif
++			rests++;
++		}
++
++		i++;
++	}
++
++	if (rests == 0) {
++		free(routetab, M_TEMP);
++		m_freem(m);
++		return ENETUNREACH;
++	}
++
++	/* Branch and forward */
++	i = branch = local = 0;
++	while (rests > 0) {
++		i = xcast6_bit_find(bmrest, i, ndest);
++		rbase = routetab[i];
++		bzero(bm, sizeof(bm));
++
++		xcast6_bit_set(bm, i);
++		xcast6_bit_clear(bmrest, i);
++		rests--;
++
++		acnt = 1;
++		is_direct = 0;
++		if ((rbase->rt_flags & (RTF_HOST|RTF_GATEWAY)) == RTF_HOST) {
++			/* Loopback check */
++			if (rbase->rt_ifp->if_type == IFT_LOOP) {
++				/* For me */
++				local++;
++				goto nextbit;
++			} else {
++				/* host route. forward now. */
++				goto forward;
++			}
++		}
++
++		/* check if it can be aggregated. */
++		j = i + 1;
++		if ((rbase->rt_flags & RTF_GATEWAY) != 0)
++			issamef = xcast6_is_same_gateway;
++		else
++			issamef = xcast6_is_same_route;
++
++		while ((j = xcast6_bit_find(bmrest, j, ndest)) >= 0) {
++			if ((*issamef)(rbase, routetab[j])) {
++				xcast6_bit_clear(bmrest, j);
++				xcast6_bit_set(bm, j);
++#if defined(__FreeBSD__) && __FreeBSD_version >= 501113
++				RTFREE(routetab[j]);
++#else
++				rtfree(routetab[j]);
++#endif
++				rests--;
++				acnt++;
++			}
++			j++;
++		}
++
++forward:
++		if (can_x2u && acnt == 1) {
++			xcast6_x2u_forward(m, &dsts[i], routetab[i],
++					   *offp + ((rthx->ip6rx_len+1) << 3),
++					   hlim, rests+local);
++		} else {
++			nm = xcast6_setup_rthdr(m, *offp, rthx, bm, &dsts[i],
++						NULL, rests+local);
++			if (nm != NULL)
++				xcast6_forward(nm, hlim);
++		}
++
++nextbit:
++#if defined(__FreeBSD__) && __FreeBSD_version >= 501113
++		RTFREE(rbase);
++#else
++		rtfree(rbase);
++#endif
++		i++;
++		branch++;
++	}
++
++	if (rests > 0)
++		xcast6_free_routes(routetab, bmrest, ndest);
++
++	free(routetab, M_TEMP);
++
++	if (local > 0) {
++		nm = xcast6_setup_rthdr(m, *offp, rthx, bmrest,
++					&dsts[0] /* dummy */, NULL, 0);
++		if (nm == NULL)
++			return ENOBUFS;
++		return 0;
++	}
++
++	return -1;
++}
++
++#ifdef USE_M_TAG
++/* XXX: The following line should go into sys/mbuf.h with appropriate value */
++#define PACKET_TAG_XCAST6 \
++	((IPV6_RTHDR_TYPE_XCAST6 << 8) | IPPROTO_ROUTING)
++#else
++#define XCAST6_M_AUX_TYPE \
++	((IPV6_RTHDR_TYPE_XCAST6 << 8) | IPPROTO_ROUTING)
++#endif
++
++struct xcast6_ctl *
++xcast6_addctl(m)
++	struct mbuf *m;
++{
++#ifdef USE_M_TAG
++	struct m_tag *tag;
++	struct xcast6_ctl *c;
++
++	tag = m_tag_find(m, PACKET_TAG_XCAST6, NULL);
++	if (tag != NULL)
++		return (struct xcast6_ctl *)(tag + 1);
++
++	/* XXX: Is MSIZE enough for x6c_rtablen? */
++	tag = m_tag_get(PACKET_TAG_XCAST6, sizeof(*c) + MSIZE, M_NOWAIT);
++	if (tag == NULL)
++		return NULL;
++
++	c = (struct xcast6_ctl *)(tag + 1);
++	bzero(c, tag->m_tag_len);
++	m_tag_prepend(m, tag);
++
++	return c;
++#else
++	struct mbuf *n;
++	struct xcast6_ctl *c;
++
++	n = m_aux_find(m, AF_INET6, XCAST6_M_AUX_TYPE);
++	if (n != NULL)
++		return mtod(n, struct xcast6_ctl *);
++	
++	n = m_aux_add(m, AF_INET6, XCAST6_M_AUX_TYPE);
++	if (n == NULL)
++		return NULL;
++
++	n->m_len = sizeof(struct xcast6_ctl);
++	bzero(mtod(n, void *), n->m_len);
++	c = mtod(n, struct xcast6_ctl *);
++
++	return mtod(n, struct xcast6_ctl *);
++#endif
++}
++
++void
++xcast6_delctl(m)
++	struct mbuf *m;
++{
++#ifdef USE_M_TAG
++	struct m_tag *tag;
++
++	tag = m_tag_find(m, PACKET_TAG_XCAST6, NULL);
++	if (tag != NULL)
++		m_tag_delete(m, tag);
++#else
++	struct mbuf *n;
++
++	n = m_aux_find(m, AF_INET6, XCAST6_M_AUX_TYPE);
++	if (n != NULL)
++		m_aux_delete(m, n);
++#endif
++}
++
++struct xcast6_ctl *
++xcast6_getctl(m)
++	struct mbuf *m;
++{
++#ifdef USE_M_TAG
++	struct m_tag *tag;
++
++	tag = m_tag_find(m, PACKET_TAG_XCAST6, NULL);
++	if (tag == NULL)
++		return NULL;
++
++	return (struct xcast6_ctl *)(tag + 1);
++#else
++	struct mbuf *n;
++
++	n = m_aux_find(m, AF_INET6, XCAST6_M_AUX_TYPE);
++	if (n == NULL)
++		return NULL;
++
++	return mtod(n, struct xcast6_ctl *);
++#endif
++}
++
++int
++xcast6_isreflectable(m, require_xcast)
++	struct mbuf *m;
++	int require_xcast;
++{
++	struct xcast6_ctl *ctl;
++
++	ctl = xcast6_getctl(m);
++	if (ctl == NULL) 
++		return !require_xcast;
++
++	return ctl->xc6_reflectable;
++}
++
++int
++xcast6_is_addr_xcast6(in6)
++	struct in6_addr *in6;
++{
++	return IN6_ARE_ADDR_EQUAL(in6, &in6addr_all_xcast6);
++}
++
++static struct mbuf *
++xcast6_copym0(m, deep)
++	struct mbuf *m;
++	int deep;
++{
++	struct mbuf *n;
++#ifndef USE_M_TAG
++	struct mbuf *c;
++	struct xcast6_ctl *oc;
++#endif
++
++	if (deep) {
++#if defined(__FreeBSD__)
++		n = m_dup(m, M_DONTWAIT);
++#else
++		n = m_dup(m, 0, M_COPYALL, M_DONTWAIT);
++#endif
++	} else
++		n = m_copym(m, 0, M_COPYALL, M_DONTWAIT);
++		
++	if (n == NULL)
++		return NULL;
++
++#ifndef USE_M_TAG
++	/* The mbuf aux is moved to the new mbuf... */
++	oc = xcast6_getctl(n);
++	if (oc != NULL) {
++		c = m_aux_add(m, AF_INET6, XCAST6_M_AUX_TYPE);
++		if (c == NULL) {
++			c = m_aux_find(n, AF_INET6, XCAST6_M_AUX_TYPE);
++			m_aux_putoff(n, c);
++			c->m_next = m->m_pkthdr.aux;
++			m->m_pkthdr.aux = c;
++			m_freem(n);
++			return NULL;
++		}
++		c->m_len = sizeof(struct xcast6_ctl);
++		*mtod(c, struct xcast6_ctl *) = *oc;
++	}
++#endif
++
++	return n;
++}
++
++static struct mbuf *
++xcast6_dupm(m)
++	struct mbuf *m;
++{
++	return xcast6_copym0(m, 1);
++}
++
++static int
++xcast6_is_same_route(r1, r2)
++	struct rtentry *r1, *r2;
++{
++	return (r1 == r2);
++}
++
++static int
++xcast6_is_same_gateway(r1, r2)
++	struct rtentry *r1, *r2;
++{
++	struct in6_addr *g1, *g2;
++
++	if ((r1->rt_flags & RTF_GATEWAY) == 0)	/* for symmetricalness */
++		return 0;
++
++	if ((r2->rt_flags & RTF_GATEWAY) == 0)
++		return 0;
++
++	if (r1->rt_gateway->sa_family != AF_INET6)
++		return 0;
++
++	if (r2->rt_gateway->sa_family != AF_INET6)
++		return 0;
++
++	if (r1->rt_ifp != r2->rt_ifp)
++		return 0;
++
++	g1 = &satosin6(r1->rt_gateway)->sin6_addr;
++	g2 = &satosin6(r2->rt_gateway)->sin6_addr;
++
++	return IN6_ARE_ADDR_EQUAL(g1, g2);
++}
++
++static int
++xcast6_forward(m, hlim)
++	struct mbuf *m;
++	int hlim;
++{
++	struct xcast6_ctl *ctl = xcast6_getctl(m);
++	struct ip6_hdr *ip6;
++	int isforward = (hlim >= 0);
++
++	/* Process hop limit if needed */
++	ip6 = mtod(m, struct ip6_hdr *);
++	if (!isforward) {
++		hlim = ip6->ip6_hlim;
++	} else {
++		if (hlim <= IPV6_HLIMDEC) {
++			/*
++			 * Send if ICMP6 time exceeded is needed.
++			 * Whether ICMP6 reply is requested or not is
++			 * checked in xcast6_isreflectable() via icmp6_error().
++			 */
++#if defined(__FreeBSD__)
++			m->m_flags |= M_LOOP;	/* XXX */
++#endif
++			icmp6_error(m, ICMP6_TIME_EXCEEDED, 
++			   ICMP6_TIME_EXCEED_TRANSIT, 0);
++			return -1;
++		}			
++		hlim -= IPV6_HLIMDEC;
++	}
++
++	ctl->xc6_hlim = hlim;
++
++	return ip6_output(m, NULL, NULL, 0, NULL, NULL, NULL);
++}
++
++static struct mbuf *
++xcast6_setup_rthdr(m, off, ox6, bm, dst, newdsts, need_copy)
++	struct mbuf *m;
++	int off;
++	struct ip6_rthdrx *ox6;
++	u_int8_t *bm;
++	struct in6_addr *dst;
++	struct in6_addr *newdsts;
++	int need_copy;
++{
++	struct ip6_rthdrx *nx6;
++	struct xcast6_ctl *ctl;
++	struct mbuf *nm;
++#ifndef PULLDOWN_TEST
++	struct mbuf *n;
++#endif
++
++	if (!need_copy) {
++		nm = m;
++		nx6 = ox6;
++	} else {
++		nm = xcast6_dupm(m);
++		if (nm == NULL)
++			return NULL;
++#ifndef PULLDOWN_TEST
++		if (nm->m_next != NULL && nm->m_pkthdr.len < MCLBYTES) {
++			MGETHDR(n, M_DONTWAIT, MT_HEADER);
++			if (n == NULL) {
++				m_freem(nm);
++				return NULL;		/* ENOBUFS */
++			}
++			M_MOVE_PKTHDR(n, nm);
++			if (n->m_pkthdr.len > MHLEN) {
++				MCLGET(n, M_DONTWAIT);
++				if ((n->m_flags & M_EXT) == 0) {
++					m_freem(n);
++					m_freem(nm);
++					return NULL;	/* ENOBUFS */
++				}
++			}
++			m_copydata(nm, 0, n->m_pkthdr.len, mtod(n, caddr_t));
++			n->m_len = n->m_pkthdr.len;
++			m_freem(nm);
++			nm = n;
++		}
++		IP6_EXTHDR_CHECK(nm, off, (ox6->ip6rx_len + 1) << 3, NULL);
++		nx6 = (struct ip6_rthdrx *)(mtod(nm, u_int8_t *) + off);
++#else
++		IP6_EXTHDR_GET(nx6, struct ip6_rthdrx *, nm, off,
++		     (ox6->ip6rx_len + 1) << 3);
++		if (nx6 == NULL)
++			return NULL;
++#endif
++	}
++	ctl = xcast6_getctl(nm);
++#ifdef notyet
++	if (ctl->x6c_icmp6nth >= 0 && xcast6_bit_test(bm, ctl->x6c_icmp6nth))
++		ctl->x6c_reflectable = 1;
++	else
++		ctl->x6c_reflectable = 0;
++#endif
++
++	ctl->xc6_dst = *dst;
++	bcopy(bm, nx6->ip6rx_dmap, sizeof(nx6->ip6rx_dmap));
++	if (newdsts)
++		bcopy(newdsts, nx6 + 1, sizeof(*newdsts) * nx6->ip6rx_ndest);
++
++	return nm;
++}
++
++#include <netinet/udp.h>
++#if defined(__FreeBSD__)
++#include <netinet/in_pcb.h>
++#endif
++#include <netinet6/in6_pcb.h>
++#include <netinet6/udp6_var.h>
++
++static int
++xcast6_x2u_forward(m, dst, rt, off, hlim, need_copy)
++	struct mbuf *m;
++	struct in6_addr *dst;
++	struct rtentry *rt;
++	int off;
++	int hlim;
++	int need_copy;
++{
++	struct ip6_hdr *ip6;
++	struct in6_addr src;
++	struct sockaddr_in6 *sin6, sin6_dst;
++	struct udphdr *uh;
++	u_int32_t flow;
++	u_int16_t plen;
++	u_int8_t vfc;
++	int error;
++	int isforward = (hlim >= 0);
++
++	ip6 = mtod(m, struct ip6_hdr *);
++	flow = ip6->ip6_flow;
++	vfc = ip6->ip6_vfc;
++	src = ip6->ip6_src;
++	if (!isforward)
++		hlim = ip6->ip6_hlim;
++
++	if (need_copy) {
++		/*
++		 * Should do deep-copy because the original packet is
++		 * completely broken by X2U.
++		 */
++		m = xcast6_dupm(m);
++		if (m == NULL)
++			return -1;
++	}
++
++	if (isforward) {
++		if (hlim <= IPV6_HLIMDEC) {
++#if defined(__FreeBSD__)
++			m->m_flags |= M_LOOP;	/* XXX */
++#endif
++			icmp6_error(m, ICMP6_TIME_EXCEEDED,
++				    ICMP6_TIME_EXCEED_TRANSIT, 0);
++			return 0;
++		}
++		hlim -= IPV6_HLIMDEC;
++	}
++
++	/*
++	 * off points to the UDP header.
++	 * Cut off preceding headers and append an IP6 header.
++	 */
++	m_adj(m, off - sizeof(struct ip6_hdr));
++	if (m->m_len < sizeof(struct ip6_hdr)) {
++		m = m_pullup(m, sizeof(struct ip6_hdr));
++		if (m == NULL)
++			return 0;
++	}
++
++	ip6 = mtod(m, struct ip6_hdr *);
++#ifndef PULLDOWN_TEST
++	IP6_EXTHDR_CHECK(m, sizeof(*ip6), sizeof(struct udphdr), 0);
++	uh = (struct udphdr *)((caddr_t)ip6 + sizeof(*ip6));
++#else
++	IP6_EXTHDR_GET(uh, struct udphdr *, m, sizeof(*ip6),
++		       sizeof(struct udphdr));
++	if (uh == NULL) {
++		udp6stat.udp6s_hdrops++;
++		return 0;
++	}
++#endif
++	ip6->ip6_vfc = vfc;
++	ip6->ip6_flow = flow;
++	plen = m->m_pkthdr.len - sizeof(*ip6);
++	ip6->ip6_plen = htons(plen);
++	ip6->ip6_nxt = IPPROTO_UDP;
++	ip6->ip6_hlim = hlim;
++	ip6->ip6_src = src;
++	ip6->ip6_dst = *dst;
++
++	if (uh->uh_sum != 0) {
++		uh->uh_sum = 0;
++		/*
++		 * We could use delta recalculation, but simply call
++		 * in6_cksum() for readability.
++		 */
++		if ((uh->uh_sum = in6_cksum(m, IPPROTO_UDP,
++					    sizeof(struct ip6_hdr),
++					    plen)) == 0)
++			uh->uh_sum = 0xffff;
++	}
++
++	if (rt->rt_flags & RTF_GATEWAY) {
++		sin6 = satosin6(rt->rt_gateway);
++	} else {
++		bzero(&sin6_dst, sizeof(sin6_dst));
++		sin6 = &sin6_dst;
++		sin6->sin6_len = sizeof(*sin6);
++		sin6->sin6_family = AF_INET6;
++		sin6->sin6_addr = *dst;
++	}
++
++#ifdef OLDIP6OUTPUT
++	error = (*rt->rt_ifp->if_output)(rt->rt_ifp, m,
++					 (struct sockaddr *)sin6, rt);
++#else
++	error = nd6_output(rt->rt_ifp, rt->rt_ifp, m, sin6, rt);
++#endif
++
++	if (error) {
++		in6_ifstat_inc(rt->rt_ifp, ifs6_out_discard);
++		if (isforward)
++			ip6stat.ip6s_cantforward++;
++	} else {
++		if (isforward) {
++			ip6stat.ip6s_forward++;
++			in6_ifstat_inc(rt->rt_ifp, ifs6_out_forward);
++		}
++	}
++
++	return 0;
++}
++
++static int
++xcast6_can_x2u(m, off, rthx)
++	struct mbuf *m;
++	int off;
++	struct ip6_rthdrx *rthx;
++{
++	struct ip6_hdr *ip6;
++
++	if (xcast6_x2u == 0)
++		return 0;
++
++	/*
++	 * We do X2U translation only when the packet format is
++	 * (IP6 | RTHDR(type=XCAST6) | UDP).
++	 */
++	if ((rthx->ip6rx_flags & XCAST6_F_DONTX2U) != 0)
++		return 0;
++
++	ip6 = mtod(m, struct ip6_hdr *);
++	if (ip6->ip6_nxt != IPPROTO_ROUTING)
++		return 0;
++
++	/*
++	 * off points to the first octet of the XCAST6 routing header.
++	 * Don't X2U if the next of IP6 header isn't XCAST6 routing header.
++	 */
++	if (off != sizeof(struct ip6_hdr))
++		return 0;
++
++	if (rthx->ip6rx_nxt != IPPROTO_UDP)
++		return 0;
++
++	return 1;
++}
++
++static void
++xcast6_free_routes(rtab, bm, len)
++	struct rtentry **rtab;
++	u_int8_t *bm;
++	int len;
++{
++	int i = 0;
++
++	while ((i = xcast6_bit_find(bm, i, len)) >= 0) {
++#if defined(__FreeBSD__) && __FreeBSD_version >= 501113
++		RTFREE(rtab[i]);
++#else
++		rtfree(rtab[i]);
++#endif
++		i++;
++	}
++}
++
++#ifndef USE_M_TAG
++static void
++m_aux_putoff(m, victim)
++	struct mbuf *m;
++	struct mbuf *victim;
++{
++	struct mbuf *n, *prev, *next;
++	struct mauxtag *t;
++
++	if ((m->m_flags & M_PKTHDR) == 0)
++		return;
++
++	prev = NULL;
++	n = m->m_pkthdr.aux;
++	while (n) {
++		t = (struct mauxtag *)n->m_dat;
++		next = n->m_next;
++		if (n == victim) {
++			if (prev)
++				prev->m_next = n->m_next;
++			else
++				m->m_pkthdr.aux = n->m_next;
++			n->m_next = NULL;
++		} else
++			prev = n;
++		n = next;
++	}
++}
++#endif
++
++#if defined(__NetBSD__)
++/* Sysctl for net.inet6.route6.  Should be in route6.c. */
++
++int
++route6_sysctl(name, namelen, oldp, oldlenp, newp, newlen)
++	int *name;
++	u_int namelen;
++	void *oldp;
++	size_t *oldlenp;
++	void *newp;
++	size_t newlen;
++{
++	/* All sysctl names at this level are terminal. */
++	if (namelen != 1)
++		return ENOTDIR;
++
++	switch (name[0]) {
++	case ROUTE6CTL_XCAST6_ENABLE:
++		return sysctl_int(oldp, oldlenp, newp, newlen,
++				  &xcast6_enable);
++
++	case ROUTE6CTL_XCAST6_X2U:
++		return sysctl_int(oldp, oldlenp, newp, newlen,
++				  &xcast6_x2u);
++	}
++
++	return ENOPROTOOPT;
++}
++#endif /* defined(__NetBSD __) */
++
++#if defined(__FreeBSD__)
++SYSCTL_DECL(_net_inet6);
++SYSCTL_NODE(_net_inet6, IPPROTO_ROUTING,route6, CTLFLAG_RW, 0, "ROUTE6");
++SYSCTL_INT(_net_inet6_route6, ROUTE6CTL_XCAST6_ENABLE,
++	xcast6_enable,	CTLFLAG_RW,	&xcast6_enable, 0, "");
++SYSCTL_INT(_net_inet6_route6, ROUTE6CTL_XCAST6_X2U,
++	xcast6_x2u,	CTLFLAG_RW,	&xcast6_x2u,	0, "");
++#endif
+diff -r c3d61d92884b -r bf910786de24 netinet6/xcast6.h
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/netinet6/xcast6.h	Mon Jun 25 14:57:31 2007 +0900
+@@ -0,0 +1,78 @@
++#ifndef _NETINET6_XCAST6_H_
++#define _NETINET6_XCAST6_H_
++
++/* flowinfo field in semi-permeable tunnel IP6 header */
++#if BYTE_ORDER == BIG_ENDIAN
++#define XCAST6_FLOWINFO		0x05c58000
++#else
++#if BYTE_ORDER == LITTLE_ENDIAN
++#define XCAST6_FLOWINFO		0x0080c505
++#endif
++#endif
++
++/* Destination address specified as ALL_XCAST_NODES in the Internet Draft. */
++#define IN6ADDR_ALLXCASTNODES_INIT \
++	{{{ 0xff, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
++	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x14 }}}
++
++#define IPV6_RTHDR_TYPE_XCAST6	253	/* should be in netinet6/in6.h */
++#define XCAST6_MAX_DESTS	126
++#define XCAST6_DMAP_LEN		16
++
++/* XCAST6 Routing header */
++struct ip6_rthdrx {
++	u_int8_t  ip6rx_nxt;		/* next header */
++	u_int8_t  ip6rx_len;		/* length in units of 8 octets */
++	u_int8_t  ip6rx_type;		/* 253 */
++	u_int8_t  ip6rx_zero;		/* always 0 */
++	u_int8_t  ip6rx_ndest;		/* number of destinations */
++	u_int8_t  ip6rx_flags;		/* flag bits */
++	u_int8_t  ip6rx_icmpoff;	/* ICMPv6 offset */
++	u_int8_t  ip6rx_reserved;	/* always 0 */
++	u_int8_t  ip6rx_dmap[XCAST6_DMAP_LEN];	/* destination bitmap */
++	/* followed by up to XCAST6_MAX_DESTS struct in6_addr */
++} __packed;
++
++/* Routing header flags field */
++#define XCAST6_F_ANON		0x80
++#define XCAST6_F_DONTX2U	0x40
++
++/* Routing header type for OS portability */
++#define XCAST6_RTHDR_TYPE	IPV6_RTHDR_TYPE_XCAST6
++
++#define XCAST6_RTHDR_LEN(ndest) \
++	(sizeof(struct ip6_rthdrx) + sizeof(struct in6_addr) * (ndest))
++
++/* sysctl variables */
++#define ROUTE6CTL_XCAST6_ENABLE		1
++#define ROUTE6CTL_XCAST6_X2U		2
++#define ROUTE6CTL_MAXID                 3
++
++#define ROUTE6CTL_NAMES { \
++        { 0, 0 }, \
++        { "xcast6_enable", CTLTYPE_INT }, \
++        { "xcast6_x2u", CTLTYPE_INT }, \
++}
++
++#ifdef _KERNEL
++struct xcast6_ctl {
++	u_int8_t xc6_hlim;
++	struct in6_addr xc6_dst;
++	int xc6_branched;
++	int xc6_reflectable;
++};
++
++extern struct in6_addr in6addr_all_xcast6;
++extern int xcast6_enable;
++extern int xcast6_x2u;
++
++struct xcast6_ctl *xcast6_addctl(struct mbuf *m);
++struct xcast6_ctl *xcast6_getctl(struct mbuf *m);
++void xcast6_delctl(struct mbuf *m);
++int xcast6_is_addr_xcast6(struct in6_addr *addr);
++int xcast6_branch(struct mbuf *m, struct ip6_rthdrx *rthx,
++		  int *offp, int hlim);
++int xcast6_isreflectable(struct mbuf *m, int require_xcast);
++#endif /* _KERNEL */
++
++#endif /* not _NETINET6_XCAST6_H_ */
