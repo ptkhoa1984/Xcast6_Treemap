@@ -1,0 +1,2099 @@
+diff -NurP linux-2.6.21/include/linux/ipv6.h linux-2.6.21-treemap/include/linux/ipv6.h
+--- linux-2.6.21/include/linux/ipv6.h	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/include/linux/ipv6.h	2009-04-02 07:38:40.000000000 +0700
+@@ -238,6 +238,17 @@
+ 	__u16			dsthao;
+ #endif
+ 
++#ifdef CONFIG_XCAST6
++	/* 24 bytes above */
++	__u8			xc6_hasflow;	/* has XCAST6 flowlabel */
++	__u8			xc6_reflectable;/* ICMPv6 reflectable */
++	__u8   			xc6_branched;	/* branching finished */
++	__u8			xc6_hlim;	/* outer hop limit */
++	__u16			xc6_raddroff;	/* raddr offset */
++	int			xc6_iif;	/* incoming interface */
++	int			xc6_icmp6nth;	/* ICMPv6 nth destination */
++#endif
++
+ #define IP6SKB_XFRM_TRANSFORMED	1
+ };
+ 
+diff -NurP linux-2.6.21/include/linux/skbuff.h linux-2.6.21-treemap/include/linux/skbuff.h
+--- linux-2.6.21/include/linux/skbuff.h	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/include/linux/skbuff.h	2009-04-02 07:38:40.000000000 +0700
+@@ -268,7 +268,7 @@
+ 	 * want to keep them across layers you have to do a skb_clone()
+ 	 * first. This is owned by whoever has the skb queued ATM.
+ 	 */
+-	char			cb[48];
++	char			cb[60];
+ 
+ 	unsigned int		len,
+ 				data_len,
+diff -NurP linux-2.6.21/include/linux/sysctl.h linux-2.6.21-treemap/include/linux/sysctl.h
+--- linux-2.6.21/include/linux/sysctl.h	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/include/linux/sysctl.h	2009-04-02 07:38:40.000000000 +0700
+@@ -541,6 +541,9 @@
+ 	NET_IPV6_IP6FRAG_TIME=23,
+ 	NET_IPV6_IP6FRAG_SECRET_INTERVAL=24,
+ 	NET_IPV6_MLD_MAX_MSF=25,
++#ifdef CONFIG_XCAST6
++	NET_IPV6_XCAST6=26,
++#endif
+ };
+ 
+ enum {
+@@ -589,6 +592,15 @@
+ 	NET_IPV6_ICMP_RATELIMIT=1
+ };
+ 
++#ifdef CONFIG_XCAST6
++/* /proc/sys/net/ipv6/xcast6 */
++enum {
++	NET_IPV6_XCAST6_ENABLE =1,
++	NET_IPV6_XCAST6_DEBUG = 2,
++	NET_IPV6_XCAST6_X2U = 3
++};
++#endif
++
+ /* /proc/sys/net/<protocol>/neigh/<dev> */
+ enum {
+ 	NET_NEIGH_MCAST_SOLICIT=1,
+diff -NurP linux-2.6.21/include/net/ipv6.h linux-2.6.21-treemap/include/net/ipv6.h
+--- linux-2.6.21/include/net/ipv6.h	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/include/net/ipv6.h	2009-04-02 07:38:40.000000000 +0700
+@@ -64,6 +64,7 @@
+ 
+ #define IPV6_ADDR_UNICAST      	0x0001U	
+ #define IPV6_ADDR_MULTICAST    	0x0002U	
++#define IPV6_ADDR_XCAST6	0x0004U
+ 
+ #define IPV6_ADDR_LOOPBACK	0x0010U
+ #define IPV6_ADDR_LINKLOCAL	0x0020U
+@@ -612,6 +613,9 @@
+ #ifdef CONFIG_SYSCTL
+ extern ctl_table ipv6_route_table[];
+ extern ctl_table ipv6_icmp_table[];
++#ifdef CONFIG_XCAST6
++extern ctl_table ipv6_xcast6_table[];
++#endif
+ 
+ extern void ipv6_sysctl_register(void);
+ extern void ipv6_sysctl_unregister(void);
+diff -NurP linux-2.6.21/include/net/xcast6.h linux-2.6.21-treemap/include/net/xcast6.h
+--- linux-2.6.21/include/net/xcast6.h	1970-01-01 07:00:00.000000000 +0700
++++ linux-2.6.21-treemap/include/net/xcast6.h	2009-04-02 07:41:14.000000000 +0700
+@@ -0,0 +1,93 @@
++#ifndef _XCAST6_H
++#define _XCAST6_H
++
++/* Destination address specified as ALL_XCAST_NODES in the Internet Draft. */
++#define IN6ADDR_ALLXCASTNODES_INIT \
++	{{{ 0xff, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
++	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x14 }}}
++
++/* constants for the XCAST6 SPT (semi-permeable tunnel) IPv6 header */
++#define XCAST6_TCLASS		0x05	/* traffic class */
++#define XCAST6_FLOW0		0xc5	/* flow label (octet 0) */
++#define XCAST6_FLOW1		0x80	/* flow label (octet 1) */
++#define XCAST6_FLOW2		0x00	/* flow label (octet 2) */
++
++#define IPV6_SRCRT_TYPE_XCAST6	253	/* should be in linux/ipv6.h */
++#define IP6OPT_TYPE_TREEMAP      0x27    /* Khoa add option type for Treemap in DstHdr */
++#define XCAST6_MAX_DESTS	126
++#define XCAST6_DMAP_LEN		16
++
++/* flags field of rtx_hdr */
++#define XCAST6_F_ANON		0x80
++#define XCAST6_F_DONTX2U	0x40
++
++#ifndef __KERNEL__
++/*
++ * Linux distributions have separate userland IPv6 headers definitions
++ * in /usr/include/netinet/ip6.h other than kernel-code definitions...
++ */
++#include <inttypes.h>
++
++struct ip6_rthdrx {
++	uint8_t  ip6rx_nxt;
++	uint8_t  ip6rx_len;
++	uint8_t  ip6rx_type;
++	uint8_t  ip6rx_zero;
++	uint8_t  ip6rx_ndest;
++	uint8_t  ip6rx_flags;
++	uint8_t  ip6rx_icmpoff;
++	uint8_t  ip6rx_reserved;
++	uint8_t  ip6rx_dmap[XCAST6_DMAP_LEN];
++	/* followed by up to XCAST6_MAX_DESTS struct in6_addr */
++};
++
++/* Routing header type for OS portability */
++#define XCAST6_RTHDR_TYPE	IPV6_SRCRT_TYPE_XCAST6
++#endif /* !__KERNEL__ */
++
++#ifdef __KERNEL__
++struct rtx_hdr {
++	struct ipv6_rt_hdr	rt_hdr;
++	__u8			ndest;
++	__u8			flags;
++	__u8			icmpoff;
++	__u8			reserved;
++	__u8			dmap[XCAST6_DMAP_LEN];
++	struct in6_addr		addr[0];	/* up to XCAST6_MAX_DESTS */
++
++#define rtx_type		rt_hdr.type
++};
++
++#ifdef CONFIG_XCAST6_DEBUG
++extern int xcast6_debug;
++
++#define XCAST6_DPRINT(msg...)			\
++	do {					\
++		if (xcast6_debug)		\
++			printk(KERN_DEBUG msg);	\
++	} while (0)
++#else /* !CONFIG_XCAST6_DEBUG */
++#define XCAST6_DPRINT(msg...)
++#endif /* CONFIG_XCAST6_DEBUG */
++
++static inline size_t xcast6_rthdrlen(int ndest)
++{
++	return sizeof(struct rtx_hdr) + sizeof(struct in6_addr) * ndest;
++}
++
++extern int xcast6_enable;
++extern int xcast6_x2u;
++extern struct in6_addr xcast6_all_nodes;
++
++int ip6_xc_input(struct sk_buff *skb);
++int ip6_xc_output(struct sk_buff *skb);
++int xcast6_spt_probe(struct sk_buff *skb);
++int xcast6_isreflectable(struct sk_buff *skb);
++int xcast6_output_branch(struct sk_buff *skb);
++int xcast6_branch(struct sk_buff *skb, struct rtx_hdr *rthx,
++		  unsigned int *nhoffp);
++
++#endif /* __KERNEL__ */
++
++#endif /* _XCAST6_H */
++
+diff -NurP linux-2.6.21/net/ipv6/addrconf.c linux-2.6.21-treemap/net/ipv6/addrconf.c
+--- linux-2.6.21/net/ipv6/addrconf.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/addrconf.c	2009-04-02 07:38:40.000000000 +0700
+@@ -76,6 +76,10 @@
+ #include <linux/if_tunnel.h>
+ #include <linux/rtnetlink.h>
+ 
++#ifdef CONFIG_XCAST6
++#include <net/xcast6.h>
++#endif
++
+ #ifdef CONFIG_IPV6_PRIVACY
+ #include <linux/random.h>
+ #endif
+@@ -877,7 +881,7 @@
+ 		 *    belonging to the same site as the outgoing
+ 		 *    interface.)
+ 		 */
+-		if ((daddr_type & IPV6_ADDR_MULTICAST ||
++		if (((daddr_type & (IPV6_ADDR_MULTICAST|IPV6_ADDR_XCAST6)) == IPV6_ADDR_MULTICAST ||
+ 		     daddr_scope <= IPV6_ADDR_SCOPE_LINKLOCAL) &&
+ 		    daddr_dev && dev != daddr_dev)
+ 			continue;
+@@ -1513,6 +1517,23 @@
+ 	ip6_route_add(&cfg);
+ }
+ 
++#ifdef CONFIG_XCAST6
++static void addrconf_add_xcroute(struct net_device *dev)
++{
++	struct fib6_config cfg = {
++		.fc_table = RT6_TABLE_LOCAL,
++		.fc_metric = IP6_RT_PRIO_ADDRCONF,
++		.fc_ifindex = dev->ifindex,
++		.fc_dst_len = 128,
++		.fc_flags = RTF_UP,
++	};
++
++	ipv6_addr_copy(&cfg.fc_dst, &xcast6_all_nodes);
++
++	ip6_route_add(&cfg);
++}
++#endif
++
+ #if defined(CONFIG_IPV6_SIT) || defined(CONFIG_IPV6_SIT_MODULE)
+ static void sit_route_add(struct net_device *dev)
+ {
+@@ -2170,6 +2191,11 @@
+ 		return;
+ 	}
+ 	ip6_tnl_add_linklocal(idev);
++
++#ifdef CONFIG_XCAST6
++	if (!strncmp(dev->name, "xc6tnl", 6))
++		addrconf_add_xcroute(dev);
++#endif
+ }
+ 
+ static int addrconf_notify(struct notifier_block *this, unsigned long event,
+diff -NurP linux-2.6.21/net/ipv6/addrconf_core.c linux-2.6.21-treemap/net/ipv6/addrconf_core.c
+--- linux-2.6.21/net/ipv6/addrconf_core.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/addrconf_core.c	2009-04-02 07:38:40.000000000 +0700
+@@ -5,6 +5,10 @@
+ 
+ #include <net/ipv6.h>
+ 
++#ifdef CONFIG_XCAST6
++#include <net/xcast6.h>
++#endif
++
+ #define IPV6_ADDR_SCOPE_TYPE(scope)	((scope) << 16)
+ 
+ static inline unsigned ipv6_addr_scope2type(unsigned scope)
+@@ -40,6 +44,12 @@
+ 	if ((st & htonl(0xFF000000)) == htonl(0xFF000000)) {
+ 		/* multicast */
+ 		/* addr-select 3.1 */
++#ifdef CONFIG_XCAST6
++		if (ipv6_addr_cmp(addr, &xcast6_all_nodes) == 0) {
++			return (IPV6_ADDR_MULTICAST | IPV6_ADDR_XCAST6 |
++				ipv6_addr_scope2type(IPV6_ADDR_MC_SCOPE(addr)));
++		}
++#endif
+ 		return (IPV6_ADDR_MULTICAST |
+ 			ipv6_addr_scope2type(IPV6_ADDR_MC_SCOPE(addr)));
+ 	}
+diff -NurP linux-2.6.21/net/ipv6/datagram.c linux-2.6.21-treemap/net/ipv6/datagram.c
+--- linux-2.6.21/net/ipv6/datagram.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/datagram.c	2009-04-02 07:38:40.000000000 +0700
+@@ -30,6 +30,9 @@
+ #include <net/transp_v6.h>
+ #include <net/ip6_route.h>
+ #include <net/tcp_states.h>
++#ifdef CONFIG_XCAST6
++#include <net/xcast6.h>
++#endif
+ 
+ #include <linux/errqueue.h>
+ #include <asm/uaccess.h>
+@@ -653,6 +656,18 @@
+ 			case IPV6_SRCRT_TYPE_2:
+ #endif
+ 				break;
++#ifdef CONFIG_XCAST6
++			case IPV6_SRCRT_TYPE_XCAST6: {
++				struct rtx_hdr *rthx;
++				rthx = (struct rtx_hdr *)rthdr;
++				if (xcast6_rthdrlen(rthx->ndest) !=
++				    (rthx->rt_hdr.hdrlen + 1) << 3) {
++					err = -EINVAL;
++					goto exit_f;
++				}
++				break;
++			}
++#endif
+ 			default:
+ 				err = -EINVAL;
+ 				goto exit_f;
+@@ -665,11 +680,19 @@
+ 				goto exit_f;
+ 			}
+ 
++#ifdef CONFIG_XCAST6
++			if (rthdr->type != IPV6_SRCRT_TYPE_XCAST6 &&
++			    (rthdr->hdrlen >> 1) != rthdr->segments_left) {
++				err = -EINVAL;
++				goto exit_f;
++			}
++#else
+ 			/* segments left must also match */
+ 			if ((rthdr->hdrlen >> 1) != rthdr->segments_left) {
+ 				err = -EINVAL;
+ 				goto exit_f;
+ 			}
++#endif
+ 
+ 			opt->opt_nflen += len;
+ 			opt->srcrt = rthdr;
+diff -NurP linux-2.6.21/net/ipv6/exthdrs.c linux-2.6.21-treemap/net/ipv6/exthdrs.c
+--- linux-2.6.21/net/ipv6/exthdrs.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/exthdrs.c	2009-04-02 11:11:47.000000000 +0700
+@@ -45,6 +45,9 @@
+ #ifdef CONFIG_IPV6_MIP6
+ #include <net/xfrm.h>
+ #endif
++#ifdef CONFIG_XCAST6
++#include <net/xcast6.h>
++#endif
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -356,6 +359,27 @@
+   Routing header.
+  ********************************/
+ 
++#ifdef	CONFIG_XCAST6
++#include <linux/in.h>
++
++static int ipv6_rthdrx_rcv(struct sk_buff *skb,
++			   struct rtx_hdr *rtx)
++{
++	struct inet6_skb_parm *opt = IP6CB(skb);
++#ifdef CONFIG_XCAST6_TREEMAP
++	if (!(rtx->rt_hdr.nexthdr == IPPROTO_ICMPV6 ||
++	      rtx->rt_hdr.nexthdr == IPPROTO_UDP ||
++		rtx->rt_hdr.nexthdr == IPPROTO_DSTOPTS))
++		return -1;
++#else
++	if (!(rtx->rt_hdr.nexthdr == IPPROTO_ICMPV6 ||
++	      rtx->rt_hdr.nexthdr == IPPROTO_UDP))
++		return -1;
++#endif
++	return xcast6_branch(skb, rtx, &opt->nhoff);
++}
++#endif	/* CONFIG_XCAST6 */
++
+ static int ipv6_rthdr_rcv(struct sk_buff **skbp)
+ {
+ 	struct sk_buff *skb = *skbp;
+@@ -398,6 +422,11 @@
+ #ifdef CONFIG_IPV6_MIP6
+ 		break;
+ #endif
++#ifdef CONFIG_XCAST6
++	case IPV6_SRCRT_TYPE_XCAST6:
++		XCAST6_DPRINT("ipv6_rthdr_rcv: nhoff=%d\n", opt->nhoff);
++		return ipv6_rthdrx_rcv(skb, (struct rtx_hdr *)hdr);
++#endif
+ 	case IPV6_SRCRT_TYPE_0:
+ 		if (accept_source_route > 0)
+ 			break;
+@@ -769,6 +798,22 @@
+ 	ihdr = (struct rt0_hdr *) opt;
+ 
+ 	phdr = (struct rt0_hdr *) skb_push(skb, (ihdr->rt_hdr.hdrlen + 1) << 3);
++#ifdef CONFIG_XCAST6
++	if (ihdr->rt_hdr.type == IPV6_SRCRT_TYPE_XCAST6) {
++		memcpy(phdr, ihdr, (ihdr->rt_hdr.hdrlen + 1) << 3);
++	} else {
++		memcpy(phdr, ihdr, sizeof(struct rt0_hdr));
++
++		hops = ihdr->rt_hdr.hdrlen >> 1;
++
++		if (hops > 1)
++			memcpy(phdr->addr, ihdr->addr + 1,
++			       (hops - 1) * sizeof(struct in6_addr));
++
++		ipv6_addr_copy(phdr->addr + (hops - 1), *addr_p);
++		*addr_p = ihdr->addr;
++	}
++#else
+ 	memcpy(phdr, ihdr, sizeof(struct rt0_hdr));
+ 
+ 	hops = ihdr->rt_hdr.hdrlen >> 1;
+@@ -779,6 +824,7 @@
+ 
+ 	ipv6_addr_copy(phdr->addr + (hops - 1), *addr_p);
+ 	*addr_p = ihdr->addr;
++#endif
+ 
+ 	phdr->rt_hdr.nexthdr = *proto;
+ 	*proto = NEXTHDR_ROUTING;
+@@ -954,4 +1000,3 @@
+ 
+ 	return opt;
+ }
+-
+diff -NurP linux-2.6.21/net/ipv6/icmp.c linux-2.6.21-treemap/net/ipv6/icmp.c
+--- linux-2.6.21/net/ipv6/icmp.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/icmp.c	2009-04-02 07:38:40.000000000 +0700
+@@ -333,7 +333,12 @@
+ 	 *	Dest addr check
+ 	 */
+ 
+-	if ((addr_type & IPV6_ADDR_MULTICAST || skb->pkt_type != PACKET_HOST)) {
++#ifdef CONFIG_XCAST6
++	/* XXX notyet */
++#endif
++	if (addr_type & IPV6_ADDR_XCAST6)
++		saddr = NULL;
++	else if ((addr_type & IPV6_ADDR_MULTICAST || skb->pkt_type != PACKET_HOST)) {
+ 		if (type != ICMPV6_PKT_TOOBIG &&
+ 		    !(type == ICMPV6_PARAMPROB &&
+ 		      code == ICMPV6_UNK_OPTION &&
+diff -NurP linux-2.6.21/net/ipv6/ip6_input.c linux-2.6.21-treemap/net/ipv6/ip6_input.c
+--- linux-2.6.21/net/ipv6/ip6_input.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/ip6_input.c	2009-04-02 07:38:40.000000000 +0700
+@@ -44,14 +44,22 @@
+ #include <net/ip6_route.h>
+ #include <net/addrconf.h>
+ #include <net/xfrm.h>
++#ifdef CONFIG_XCAST6
++#include <net/xcast6.h>
+ 
+-
++static int ip6_xctnl_input(struct sk_buff *skb);
++#endif
+ 
+ inline int ip6_rcv_finish( struct sk_buff *skb)
+ {
+ 	if (skb->dst == NULL)
+ 		ip6_route_input(skb);
+ 
++#ifdef CONFIG_XCAST6
++	if (xcast6_spt_probe(skb))
++		return ip6_xctnl_input(skb);
++#endif
++
+ 	return dst_input(skb);
+ }
+ 
+@@ -187,6 +195,9 @@
+ 			if (ipv6_addr_is_multicast(&hdr->daddr) &&
+ 			    !ipv6_chk_mcast_addr(skb->dev, &hdr->daddr,
+ 			    &hdr->saddr) &&
++#ifdef CONFIG_XCAST6
++			    !IP6CB(skb)->xc6_branched &&
++#endif
+ 			    !ipv6_is_mld(skb, nexthdr))
+ 				goto discard;
+ 		}
+@@ -227,6 +238,31 @@
+ 	return NF_HOOK(PF_INET6,NF_IP6_LOCAL_IN, skb, skb->dev, NULL, ip6_input_finish);
+ }
+ 
++#ifdef CONFIG_XCAST6
++static int ip6_xctnl_input(struct sk_buff *skb)
++{
++	BUG_ON(!IP6CB(skb)->xc6_hasflow);
++
++	/* has XCAST6 flowlabel but not a tunneling packet. */
++	if (skb->nh.raw[IP6CB(skb)->nhoff] != IPPROTO_IPV6)
++		goto err;
++
++	/* check for inner destination address is done in tunneling code */
++	if (skb->dst->input == ip6_input)
++		return NF_HOOK(PF_INET6, NF_IP6_LOCAL_IN, skb, skb->dev,
++				NULL, ip6_input_finish);
++	else
++		return NF_HOOK(PF_INET6, NF_IP6_FORWARD, skb, skb->dev,
++				skb->dst->dev, ip6_input_finish);
++
++err:
++	IP6_INC_STATS_BH(ip6_dst_idev(skb->dst), IPSTATS_MIB_INHDRERRORS);
++	kfree_skb(skb);
++
++	return 0;
++}
++#endif /* CONFIG_XCAST6 */
++
+ int ip6_mc_input(struct sk_buff *skb)
+ {
+ 	struct ipv6hdr *hdr;
+diff -NurP linux-2.6.21/net/ipv6/ip6_output.c linux-2.6.21-treemap/net/ipv6/ip6_output.c
+--- linux-2.6.21/net/ipv6/ip6_output.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/ip6_output.c	2009-04-02 07:38:40.000000000 +0700
+@@ -55,6 +55,9 @@
+ #include <net/icmp.h>
+ #include <net/xfrm.h>
+ #include <net/checksum.h>
++#ifdef CONFIG_XCAST6
++#include <net/xcast6.h>
++#endif
+ 
+ static int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *));
+ 
+@@ -137,15 +140,49 @@
+ 	return NF_HOOK(PF_INET6, NF_IP6_POST_ROUTING, skb,NULL, skb->dev,ip6_output_finish);
+ }
+ 
+-int ip6_output(struct sk_buff *skb)
++static int __ip6_outputf(struct sk_buff *skb, int (*out2f)(struct sk_buff *))
+ {
+ 	if ((skb->len > dst_mtu(skb->dst) && !skb_is_gso(skb)) ||
+ 				dst_allfrag(skb->dst))
+-		return ip6_fragment(skb, ip6_output2);
++		return ip6_fragment(skb, out2f);
+ 	else
+-		return ip6_output2(skb);
++		return (*out2f)(skb);
++}
++
++int ip6_output(struct sk_buff *skb)
++{
++	return __ip6_outputf(skb, &ip6_output2);
+ }
+ 
++#ifdef CONFIG_XCAST6
++static int ip6_xc_output2(struct sk_buff *skb)
++{
++	struct dst_entry *dst = skb->dst;
++	struct net_device *dev = dst->dev;
++
++	if (IP6CB(skb)->xc6_branched) {
++		/* avoid multicast loopback here for XCAST6 packets */
++		return NF_HOOK(PF_INET6, NF_IP6_POST_ROUTING, skb, NULL,
++			       skb->dev, ip6_output_finish);
++	} else {
++		IP6_INC_STATS(ip6_dst_idev(dst), IPSTATS_MIB_OUTMCASTPKTS);
++		skb->protocol = htons(ETH_P_IPV6);
++		skb->dev = dev;
++		xcast6_output_branch(skb);
++	}
++
++	return 0;
++}
++
++int ip6_xc_output(struct sk_buff *skb)
++{
++	if (!xcast6_enable)
++		return ip6_output(skb);
++
++	return __ip6_outputf(skb, &ip6_xc_output2);
++}
++#endif
++
+ /*
+  *	xmit an sk_buff (used by TCP)
+  */
+diff -NurP linux-2.6.21/net/ipv6/Kconfig linux-2.6.21-treemap/net/ipv6/Kconfig
+--- linux-2.6.21/net/ipv6/Kconfig	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/Kconfig	2009-04-02 07:42:03.000000000 +0700
+@@ -107,6 +107,33 @@
+ 
+ 	  If unsure, say N.
+ 
++config XCAST6
++	bool "IPv6: XCAST6 support"
++	depends on IPV6
++	select XC6_TUNNEL
++	---help---
++	  Support for XCAST6 (Explicit Multi-unicast over IPv6).
++
++	  If unsure, say N.
++
++config XCAST6_DEBUG
++	bool "IPv6: XCAST6 debugging"
++	depends on XCAST6
++	---help---
++	  Enable verbose kernel logs on XCAST6
++
++	  If unsure, say N.
++config XCAST6_TREEMAP
++	bool "IPv6: XCAST6 TREEMAP"
++	depends on XCAST6
++	---help---
++	 Enable TREEMAP for XCAST6
++ 	 
++config XC6_TUNNEL
++	tristate
++	select INET6_TUNNEL
++	default n
++
+ config INET6_XFRM_TUNNEL
+ 	tristate
+ 	select INET6_TUNNEL
+diff -NurP linux-2.6.21/net/ipv6/Makefile linux-2.6.21-treemap/net/ipv6/Makefile
+--- linux-2.6.21/net/ipv6/Makefile	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/Makefile	2009-04-02 07:38:40.000000000 +0700
+@@ -15,6 +15,7 @@
+ ipv6-$(CONFIG_NETFILTER) += netfilter.o
+ ipv6-$(CONFIG_IPV6_MULTIPLE_TABLES) += fib6_rules.o
+ ipv6-$(CONFIG_IPV6_MIP6) += mip6.o
++ipv6-$(CONFIG_XCAST6) += xcast6.o
+ 
+ ipv6-objs += $(ipv6-y)
+ 
+@@ -31,7 +32,8 @@
+ 
+ obj-$(CONFIG_IPV6_SIT) += sit.o
+ obj-$(CONFIG_IPV6_TUNNEL) += ip6_tunnel.o
++obj-$(CONFIG_XC6_TUNNEL) += xc6_tunnel.o
+ 
+-obj-y += addrconf_core.o exthdrs_core.o
++obj-y += addrconf_core.o exthdrs_core.o xcast6_core.o
+ 
+ obj-$(subst m,y,$(CONFIG_IPV6)) += inet6_hashtables.o
+diff -NurP linux-2.6.21/net/ipv6/raw.c linux-2.6.21-treemap/net/ipv6/raw.c
+--- linux-2.6.21/net/ipv6/raw.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/raw.c	2009-04-02 07:38:40.000000000 +0700
+@@ -797,7 +797,7 @@
+ 		ipv6_addr_copy(&fl.fl6_src, &np->saddr);
+ 
+ 	/* merge ip6_build_xmit from ip6_output */
+-	if (opt && opt->srcrt) {
++	if (opt && opt->srcrt && opt->srcrt->type == IPV6_SRCRT_TYPE_0) {
+ 		struct rt0_hdr *rt0 = (struct rt0_hdr *) opt->srcrt;
+ 		ipv6_addr_copy(&final, &fl.fl6_dst);
+ 		ipv6_addr_copy(&fl.fl6_dst, rt0->addr);
+diff -NurP linux-2.6.21/net/ipv6/route.c linux-2.6.21-treemap/net/ipv6/route.c
+--- linux-2.6.21/net/ipv6/route.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/route.c	2009-04-02 07:38:40.000000000 +0700
+@@ -56,6 +56,9 @@
+ #include <net/xfrm.h>
+ #include <net/netevent.h>
+ #include <net/netlink.h>
++#ifdef CONFIG_XCAST6
++#include <net/xcast6.h>
++#endif
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -1098,11 +1101,21 @@
+ 
+ 	addr_type = ipv6_addr_type(&cfg->fc_dst);
+ 
++#ifdef CONFIG_XCAST6
++	if (addr_type & IPV6_ADDR_XCAST6)
++		rt->u.dst.input = ip6_xc_input;
++	else
++#endif
+ 	if (addr_type & IPV6_ADDR_MULTICAST)
+ 		rt->u.dst.input = ip6_mc_input;
+ 	else
+ 		rt->u.dst.input = ip6_forward;
+ 
++#ifdef CONFIG_XCAST6
++	if (addr_type & IPV6_ADDR_XCAST6)
++		rt->u.dst.output = ip6_xc_output;
++	else
++#endif
+ 	rt->u.dst.output = ip6_output;
+ 
+ 	ipv6_addr_prefix(&rt->rt6i_dst.addr, &cfg->fc_dst, cfg->fc_dst_len);
+diff -NurP linux-2.6.21/net/ipv6/sysctl_net_ipv6.c linux-2.6.21-treemap/net/ipv6/sysctl_net_ipv6.c
+--- linux-2.6.21/net/ipv6/sysctl_net_ipv6.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/sysctl_net_ipv6.c	2009-04-02 07:38:40.000000000 +0700
+@@ -80,6 +80,15 @@
+ 		.mode		= 0644,
+ 		.proc_handler	= &proc_dointvec
+ 	},
++#ifdef CONFIG_XCAST6
++	{
++		.ctl_name	= NET_IPV6_XCAST6,
++		.procname	= "xcast6",
++		.maxlen		= 0,
++		.mode		= 0555,
++		.child		= ipv6_xcast6_table
++	},
++#endif
+ 	{ .ctl_name = 0 }
+ };
+ 
+diff -NurP linux-2.6.21/net/ipv6/udp.c linux-2.6.21-treemap/net/ipv6/udp.c
+--- linux-2.6.21/net/ipv6/udp.c	2007-04-26 10:08:32.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/udp.c	2009-04-02 07:38:40.000000000 +0700
+@@ -714,7 +714,7 @@
+ 	fl.fl_ip_sport = inet->sport;
+ 
+ 	/* merge ip6_build_xmit from ip6_output */
+-	if (opt && opt->srcrt) {
++	if (opt && opt->srcrt && opt->srcrt->type == IPV6_SRCRT_TYPE_0) {
+ 		struct rt0_hdr *rt0 = (struct rt0_hdr *) opt->srcrt;
+ 		ipv6_addr_copy(&final, &fl.fl6_dst);
+ 		ipv6_addr_copy(&fl.fl6_dst, rt0->addr);
+diff -NurP linux-2.6.21/net/ipv6/xc6_tunnel.c linux-2.6.21-treemap/net/ipv6/xc6_tunnel.c
+--- linux-2.6.21/net/ipv6/xc6_tunnel.c	1970-01-01 07:00:00.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/xc6_tunnel.c	2009-04-02 07:38:40.000000000 +0700
+@@ -0,0 +1,335 @@
++/*
++ *  XCAST6 semi-permeable tunneling interface based on ip6_tunnel
++ */
++
++#include <linux/module.h>
++#include <linux/capability.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/sockios.h>
++#include <linux/if.h>
++#include <linux/in.h>
++#include <linux/ip.h>
++#include <linux/if_tunnel.h>
++#include <linux/net.h>
++#include <linux/in6.h>
++#include <linux/netdevice.h>
++#include <linux/if_arp.h>
++#include <linux/icmpv6.h>
++#include <linux/init.h>
++#include <linux/route.h>
++#include <linux/rtnetlink.h>
++#include <linux/netfilter_ipv6.h>
++
++#include <asm/uaccess.h>
++#include <asm/atomic.h>
++
++#include <net/ip.h>
++#include <net/ipv6.h>
++#include <net/ip6_route.h>
++#include <net/addrconf.h>
++#include <net/ip6_tunnel.h>
++#include <net/xfrm.h>
++#include <net/xcast6.h>
++
++MODULE_AUTHOR("KUROSAWA Takahiro");
++MODULE_DESCRIPTION("XCAST6 semi-permeable tunnel");
++MODULE_LICENSE("GPL");
++
++struct xc6tnl {
++	struct net_device *dev;
++	struct net_device_stats stat;
++	int recursion;
++};
++
++static struct net_device *xc6tnl_dev;
++
++static int xc6tnl_dev_init(struct net_device *dev)
++{
++	struct xc6tnl *t = netdev_priv(dev);
++	t->dev = dev;
++	dev_hold(dev);
++
++	return 0;
++}
++
++static void xc6tnl_dev_uninit(struct net_device *dev)
++{
++	dev_put(dev);
++}
++
++static int xc6tnl_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct xc6tnl *t = netdev_priv(dev);
++	struct net_device_stats *stats = &t->stat;
++	struct ipv6hdr *ipv6h;
++	struct flowi fl;
++	struct dst_entry *dst;
++	struct net_device *tdev;
++	int mtu;
++	int max_headroom = sizeof(struct ipv6hdr);
++	__u8 proto = IPPROTO_IPV6;
++	int err;
++	int pkt_len;
++
++	if (t->recursion++) {
++		stats->collisions++;
++		goto tx_err;
++	}
++
++	if (skb->protocol != __constant_htons(ETH_P_IPV6))
++		goto tx_err;
++
++	memset(&fl, 0, sizeof(fl));
++	fl.proto = IPPROTO_IPV6;
++	memcpy(&fl.fl6_dst, skb->nh.raw + IP6CB(skb)->xc6_raddroff,
++	       sizeof(fl.fl6_dst));
++
++	err = ip6_dst_lookup(NULL, &dst, &fl);
++	if (err)
++		goto tx_err_link_failure;
++
++	if (xfrm_lookup(&dst, &fl, NULL, 0) < 0)
++		goto tx_err_link_failure;
++
++	tdev = dst->dev;
++
++	if (tdev == dev) {
++		stats->collisions++;
++		if (net_ratelimit())
++			printk(KERN_WARNING
++			       "xc6_tunnel: Local routing loop detected!\n");
++		goto tx_err_dst_release;
++	}
++
++	mtu = dst_mtu(dst) - sizeof (*ipv6h);
++	if (mtu < IPV6_MIN_MTU)
++		mtu = IPV6_MIN_MTU;
++	if (skb->dst)
++		skb->dst->ops->update_pmtu(skb->dst, mtu);
++	if (skb->len > mtu) {
++		icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu, dev);
++		goto tx_err_dst_release;
++	}
++
++	/*
++	 * Okay, now see if we can stuff it in the buffer as-is.
++	 */
++	max_headroom += LL_RESERVED_SPACE(tdev);
++
++	if (skb_headroom(skb) < max_headroom ||
++	    skb_cloned(skb) || skb_shared(skb)) {
++		struct sk_buff *new_skb;
++
++		if (!(new_skb = skb_realloc_headroom(skb, max_headroom)))
++			goto tx_err_dst_release;
++
++		if (skb->sk)
++			skb_set_owner_w(new_skb, skb->sk);
++		kfree_skb(skb);
++		skb = new_skb;
++	}
++	dst_release(skb->dst);
++	skb->dst = dst_clone(dst);
++
++	skb->h.raw = skb->nh.raw;
++	skb->nh.raw = skb_push(skb, sizeof(struct ipv6hdr));
++	ipv6h = skb->nh.ipv6h;
++	ipv6h->version = 6;
++	ipv6h->priority = XCAST6_TCLASS;
++	ipv6h->flow_lbl[0] = XCAST6_FLOW0;
++	ipv6h->flow_lbl[1] = XCAST6_FLOW1;
++	ipv6h->flow_lbl[2] = XCAST6_FLOW2;
++	ipv6h->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
++	ipv6h->hop_limit = IP6CB(skb)->xc6_hlim;
++	ipv6h->nexthdr = proto;
++	ipv6_addr_copy(&ipv6h->saddr, &fl.fl6_src);
++	ipv6_addr_copy(&ipv6h->daddr, &fl.fl6_dst);
++	nf_reset(skb);
++	pkt_len = skb->len;
++	err = NF_HOOK(PF_INET6, NF_IP6_LOCAL_OUT, skb, NULL,
++		      skb->dst->dev, dst_output);
++
++	if (net_xmit_eval(err) == 0) {
++		stats->tx_bytes += pkt_len;
++		stats->tx_packets++;
++	} else {
++		stats->tx_errors++;
++		stats->tx_aborted_errors++;
++	}
++	t->recursion--;
++	return 0;
++tx_err_link_failure:
++	stats->tx_carrier_errors++;
++	dst_link_failure(skb);
++tx_err_dst_release:
++	dst_release(dst);
++tx_err:
++	stats->tx_errors++;
++	stats->tx_dropped++;
++	kfree_skb(skb);
++	t->recursion--;
++	return 0;
++}
++
++static struct net_device_stats *xc6tnl_get_stats(struct net_device *dev)
++{
++	return &(((struct xc6tnl *)netdev_priv(dev))->stat);
++}
++
++static int xc6tnl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
++{
++	return -EINVAL;
++}
++
++static int xc6tnl_change_mtu(struct net_device *dev, int new_mtu)
++{
++	if (new_mtu < IPV6_MIN_MTU) {
++		return -EINVAL;
++	}
++	dev->mtu = new_mtu;
++	return 0;
++}
++
++static int xc6tnl_rcv(struct sk_buff *skb)
++{
++	struct ipv6hdr *ipv6h;
++	struct xc6tnl *t = netdev_priv(xc6tnl_dev);
++	struct inet6_skb_parm *opt;
++	__u8 hlim;
++
++	opt = IP6CB(skb);
++
++	if (!opt->xc6_hasflow)
++		return 1;	/* not an XCAST6 packet */
++
++	hlim = skb->nh.ipv6h->hop_limit;
++
++	if (!pskb_may_pull(skb, skb->h.raw - skb->data + sizeof(*ipv6h)))
++		goto discard;
++
++	ipv6h = skb->h.ipv6h;
++	if (ipv6_addr_cmp(&ipv6h->daddr, &xcast6_all_nodes))
++		return 1;	/* not an XCAST6 packet */
++
++	secpath_reset(skb);
++	skb->mac.raw = skb->nh.raw;
++	skb->nh.raw = skb->data;
++	skb->protocol = htons(ETH_P_IPV6);
++	skb->pkt_type = PACKET_HOST;
++	memset(skb->cb, 0, sizeof(struct inet6_skb_parm));
++	IP6CB(skb)->xc6_hlim = hlim;	/* need to record outer hlim */
++	skb->dev = t->dev;
++	dst_release(skb->dst);
++	skb->dst = NULL;
++	nf_reset(skb);
++	t->stat.rx_packets++;
++	t->stat.rx_bytes += skb->len;
++	netif_rx(skb);
++	return 0;
++
++discard:
++	kfree_skb(skb);
++	return 0;
++}
++
++static int xc6tnl_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
++		      int type, int code, int offset, __be32 info)
++{
++	struct ipv6hdr *ipv6h = (struct ipv6hdr *)skb->data;
++#ifdef notyet
++	struct xc6tnl *t;
++	int rel_msg = 0;
++	int rel_type = ICMPV6_DEST_UNREACH;
++	int rel_code = ICMPV6_ADDR_UNREACH;
++	__u32 rel_info = 0;
++	__u16 len;
++#endif
++	int err = -ENOENT;
++
++	if (ipv6h->priority != XCAST6_TCLASS ||
++	    ipv6h->flow_lbl[0] != XCAST6_FLOW0 ||
++	    ipv6h->flow_lbl[1] != XCAST6_FLOW1 ||
++	    ipv6h->flow_lbl[2] != XCAST6_FLOW2 ||
++	    ipv6h->nexthdr != IPPROTO_IPV6)
++		goto out;
++
++	/* XXX notyet */
++	/*
++	 * DST_UNREACH: forward if icmp6 offset in the routing header is ok.
++	 * PKT_TOOBIG:  forward.
++	 * TIME_EXCEED: forward if icmp6 offset in the routing header is ok.
++	 * PARAMPROB:   log??? (or forward if offset is ok?)
++	 */
++
++out:
++	return err;
++}
++
++static struct xfrm6_tunnel xc6tnl_handler = {
++	.handler	= xc6tnl_rcv,
++	.err_handler	= xc6tnl_err,
++	.priority	= 0,
++};
++
++static void xc6tnl_dev_setup(struct net_device *dev)
++{
++	SET_MODULE_OWNER(dev);
++	dev->uninit = xc6tnl_dev_uninit;
++	dev->destructor = free_netdev;
++	dev->hard_start_xmit = xc6tnl_xmit;
++	dev->get_stats = xc6tnl_get_stats;
++	dev->do_ioctl = xc6tnl_ioctl;
++	dev->change_mtu = xc6tnl_change_mtu;
++
++	dev->type = ARPHRD_TUNNEL6;
++	dev->hard_header_len = LL_MAX_HEADER + sizeof(struct ipv6hdr);
++	dev->flags |= IFF_NOARP;
++	dev->addr_len = sizeof(struct in6_addr);
++	dev->mtu = ETH_DATA_LEN - sizeof(struct ipv6hdr);
++}
++
++static int __init xc6tnl_init(void)
++{
++	int err;
++
++	if (xfrm6_tunnel_register(&xc6tnl_handler, AF_INET6)) {
++		printk(KERN_ERR "xc6tnl init: can not register tunnel\n");
++		return -EAGAIN;
++	}
++
++	xc6tnl_dev = alloc_netdev(sizeof(struct xc6tnl), "xc6tnl0",
++				  xc6tnl_dev_setup);
++
++	if (!xc6tnl_dev) {
++		err = -ENOMEM;
++		goto fail;
++	}
++
++	xc6tnl_dev->init = xc6tnl_dev_init;
++
++	if ((err = register_netdev(xc6tnl_dev)) != 0) {
++		free_netdev(xc6tnl_dev);
++		goto fail;
++	}
++
++	return 0;
++
++fail:
++	xfrm6_tunnel_deregister(&xc6tnl_handler, AF_INET6);
++	return err;
++}
++
++static void __exit xc6tnl_cleanup(void)
++{
++	if (xfrm6_tunnel_deregister(&xc6tnl_handler, AF_INET6))
++		printk(KERN_INFO
++		       "xc6tnl_cleanup: could not deregister tunnel\n");
++
++	rtnl_lock();
++	unregister_netdevice(xc6tnl_dev);
++	rtnl_unlock();
++}
++
++module_init(xc6tnl_init);
++module_exit(xc6tnl_cleanup);
+diff -NurP linux-2.6.21/net/ipv6/xcast6.c linux-2.6.21-treemap/net/ipv6/xcast6.c
+--- linux-2.6.21/net/ipv6/xcast6.c	1970-01-01 07:00:00.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/xcast6.c	2009-04-04 23:51:19.000000000 +0700
+@@ -0,0 +1,1052 @@
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#include <linux/socket.h>
++#include <linux/sockios.h>
++#include <linux/sched.h>
++#include <linux/net.h>
++#include <linux/in6.h>
++#include <linux/netdevice.h>
++#include <linux/if_arp.h>
++#include <linux/route.h>
++#include <linux/init.h>
++#include <linux/proc_fs.h>
++#include <linux/udp.h>
++#include <linux/smp_lock.h>
++
++#include <asm/bitops.h>
++
++#ifdef 	CONFIG_PROC_FS
++#include <linux/proc_fs.h>
++#endif 	//CONFIG_PROC_FS
++
++#include <net/sock.h>
++#include <net/snmp.h>
++
++#include <net/ipv6.h>
++#include <net/protocol.h>
++#include <net/if_inet6.h>
++#include <net/ndisc.h>
++#include <net/addrconf.h>
++#include <net/ip6_route.h>
++#include <net/rawv6.h>
++#include <net/transp_v6.h>
++#include <net/checksum.h>
++#include <net/xfrm.h>
++#include <net/xcast6.h>
++
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv6.h>
++
++#ifdef CONFIG_SYSCTL
++#include <linux/sysctl.h>
++#endif
++
++static struct sk_buff *xcast6_setup_skb(struct sk_buff *,
++					int,
++					struct rtx_hdr *,
++					__u8 *,
++					struct in6_addr *,
++					int);
++static int xcast6_forward(struct sk_buff *, 
++			  struct rt6_info *,
++			  int);
++static int xcast6_x2u_forward(struct sk_buff *, 
++			      struct rt6_info *, 
++			      int);
++static int xcast6_is_same_gateway(struct rt6_info *, struct rt6_info *);
++static int xcast6_is_same_route(struct rt6_info *, struct rt6_info *);
++static char *ip6_sprintf(const struct in6_addr *);
++
++int xcast6_enable = 0;
++int xcast6_x2u = 0;
++#ifdef CONFIG_XCAST6_DEBUG
++int xcast6_debug = 0;
++#endif
++
++#define MAXNODE 64 //max number of node for each Xcast session
++
++#define setBit(b,n) \ 
++	b |= (1<<n)
++
++#define testBit(b, n) \
++	b & (1 << n)
++
++static inline int
++xcast6_bit_test(__u8 *bm, int offset)
++{
++	return bm[offset >> 3] & (1 << (offset & 7));
++}
++
++static inline void
++xcast6_bit_set(__u8 *bm, int offset)
++{
++	bm[offset >> 3] |= (__u8)(1 << (offset & 7));
++}
++
++static inline void
++
++xcast6_bit_clear(__u8 *bm, int offset)
++{
++	bm[offset >> 3] &= (__u8)(~(1 << (offset & 7)));
++}
++
++static inline int
++xcast6_bit_next(__u8 *bm, int len, int off)
++{
++	register int i;
++	int base = off / 8;
++	int stop = (len + 7) / 8;
++
++        for (i = base; i < stop; i++) {
++		register int s, b, j;
++		int ret;
++
++		if (bm[i] == 0)
++			continue;
++
++		b = bm[i];
++		if (i == base)
++			j = off & 7;
++		else
++			j = 0;
++
++		for (s = (1 << j); j < 8; s <<= 1, j++) {
++			ret = i * 8 + j;
++			if (ret >= len)
++				return len;
++			if ((b & s) != 0)
++				return ret;
++		}
++	}
++	return len;
++}
++#ifdef CONFIG_XCAST6_TREEMAP
++/* 
++ * convert org_treemap (each element is represented by 4 bits in packet header)
++ * to treemap (each element is represented by 1 byte).
++ */
++void convert_treemap(char ndest, char* org_treemap, char* treemap) {
++	int i;
++	int l = (ndest + 1)/2;	
++	for (i = 0; i < l; i++) {
++		treemap[2*i] = (org_treemap[i] & 240) >> 4;
++		treemap[2*i + 1] = org_treemap[i] & 15;
++	}	
++	if (ndest % 2 == 0) treemap[ndest] = (org_treemap[ndest/2] & 240) >> 4;
++}
++
++/*
++ * traverse the treemap to find subTree
++ */
++void find_subtree(char* treemap, char* icount, u_int8_t* bm, u_int8_t* nbm, 
++				int curNode, int ndest){
++	int i;
++	int istart, iend;
++	if (xcast6_bit_test(bm, curNode)) {
++		//set bitmap for children node
++		xcast6_bit_set(nbm, curNode);
++	}				
++	istart = icount[curNode];	
++	iend = icount[curNode + 1];
++	if (istart >= iend) return;
++	for (i = istart; i < iend; i++) {
++		find_subtree(treemap, icount, bm, nbm, i, ndest);	
++		
++	}
++}
++#endif
++
++int
++xcast6_isreflectable(struct sk_buff *skb)
++{
++	if (IP6CB(skb)->xc6_icmp6nth < 0)
++		return 0;
++
++	return IP6CB(skb)->xc6_reflectable;
++}
++
++int
++xcast6_spt_probe(struct sk_buff *skb)
++{
++	struct ipv6hdr *ipv6h;
++
++	if (!xcast6_enable)
++		return 0;
++
++	ipv6h = skb->nh.ipv6h;
++	if (ipv6h->priority != XCAST6_TCLASS ||
++	    ipv6h->flow_lbl[0] != XCAST6_FLOW0 ||
++	    ipv6h->flow_lbl[1] != XCAST6_FLOW1 ||
++	    ipv6h->flow_lbl[2] != XCAST6_FLOW2 ||
++	    ipv6h->nexthdr != IPPROTO_IPV6)
++		return 0;
++
++	IP6CB(skb)->xc6_hasflow++;
++
++	return 1;
++}
++
++int
++ip6_xc_input(struct sk_buff *skb)
++{
++	if (!xcast6_enable)
++		return ip6_mc_input(skb);
++
++	IP6_INC_STATS_BH(ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
++	ip6_input(skb);
++
++	return 0;
++}
++
++/*
++ * XXX dirty and ugly. should be revisited.
++ */
++int
++xcast6_output_branch(struct sk_buff *skb)
++{
++	struct inet6_protocol *ipprot;
++	struct ipv6hdr *hdr;
++	struct ipv6_rt_hdr *rth;
++	u8 hash;
++
++	hdr = skb->nh.ipv6h;
++	skb->h.raw = skb->nh.raw + sizeof(struct ipv6hdr);
++	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
++
++	XCAST6_DPRINT("output_branch: h.raw=%p nh.raw=%p\n",
++		      skb->h.raw, skb->nh.raw);
++	
++	/*
++	 * XXX  We do not allow any extension headers between
++	 *      the IPv6 header and the XCAST6 routing header here.
++	 *      This might cause a problem in the future.
++	 */
++	if (hdr->nexthdr != IPPROTO_ROUTING) {
++		kfree_skb(skb);
++		XCAST6_DPRINT("IP6.nexthdr=%d (!= IPPROTO_ROUTING)\n",
++			      hdr->nexthdr);
++		return -EINVAL;
++	}
++
++	rth = (struct ipv6_rt_hdr *)skb->h.raw;
++	if (rth->type != IPV6_SRCRT_TYPE_XCAST6) {
++		kfree_skb(skb);
++		XCAST6_DPRINT("rthdr.type=%d (!= IPV6_SRCRT_XCAST6)\n",
++			      rth->type);
++		return -EINVAL;
++	}
++
++	XCAST6_DPRINT("outout_branch: nexthdr=%02x\n", rth->nexthdr);
++	hash =  hdr->nexthdr & (MAX_INET_PROTOS - 1);
++	rcu_read_lock();
++	ipprot = rcu_dereference(inet6_protos[hash]);
++	ipprot->handler(&skb);
++	rcu_read_unlock();
++
++	return 0;
++}
++
++#ifdef CONFIG_XCAST6_TREEMAP
++int
++xcast6_branch(struct sk_buff *skb,
++	      struct rtx_hdr *rthx,
++	      unsigned int *nhoffp)
++{
++	struct sk_buff *nskb;
++	struct in6_addr *dests;
++	struct flowi fl;
++	struct rt6_info **rtt;
++	__u8 bm[XCAST6_DMAP_LEN];
++	__u8 nbm[XCAST6_DMAP_LEN];
++	
++	int hlim;
++	int i, j, t1, t2, t3;
++	int rests = 0;
++	int branch, acnt;
++	int ndest;
++	int is_direct, local;
++	int can_x2u;
++	int minmtu;
++	int ret;
++	int (*issamef)(struct rt6_info *, struct rt6_info *);
++		
++	__u8 orig_bm[XCAST6_DMAP_LEN]; //used for Treemap, same as bm[]
++	__u8 child_bm[XCAST6_DMAP_LEN];
++	__u8 branch_bm[XCAST6_DMAP_LEN];
++	__u8 remain_bm[XCAST6_DMAP_LEN]; // used for same level forwarding
++	int routing_len;
++	int isXcastTreemap;
++	char* org_treemap;
++	char* treemap;
++	char icount[MAXNODE];
++	int hostIndex;
++	int istart;
++	struct in6_addr *addr;
++	
++	
++	uint8_t* destHeader;
++	uint8_t* Treemap_type;
++	
++	BUG_ON(rthx->rtx_type != IPV6_SRCRT_TYPE_XCAST6);
++
++	dst_release(skb->dst);
++	skb->dst = NULL;
++
++	ret = -1;
++	rtt = NULL;
++	ndest = rthx->ndest;
++	if(ndest < 1) {
++		XCAST6_DPRINT("xcast6_branch: ndest(%d) < 1\n", ndest);
++		kfree_skb(skb);
++		goto bad;
++	}
++
++	if (IP6CB(skb)->xc6_icmp6nth >= ndest) {
++		XCAST6_DPRINT("xcast6_branch: icmp6nth(%d) > ndest(%d)\n",
++			      IP6CB(skb)->xc6_icmp6nth, ndest);
++		kfree_skb(skb);
++		goto bad;
++	}
++	if (xcast6_rthdrlen(rthx->ndest) != (rthx->rt_hdr.hdrlen + 1) << 3) {
++		XCAST6_DPRINT("xcast6_branch: invalid packet length\n");
++		kfree_skb(skb);
++		goto bad;
++	}
++	XCAST6_DPRINT("xcast6_branch: nhoff=%d\n", *nhoffp);
++	
++	// Access Treemap field
++	routing_len = (rthx->rt_hdr.hdrlen + 1) * 8;
++	isXcastTreemap = 0;
++	destHeader =(uint8_t*) ((uint8_t*)rthx + routing_len);
++	
++	treemap = kmalloc(MAXNODE, GFP_ATOMIC);
++	
++	if (rthx->rt_hdr.nexthdr == IPPROTO_DSTOPTS) {
++		//check the type of Treemap in DstHdr
++		Treemap_type = (destHeader + 2);
++		
++		if (*Treemap_type == IP6OPT_TYPE_TREEMAP) {
++			isXcastTreemap = 1;
++			org_treemap  = (destHeader + 4);			
++			for (j = 0; j < MAXNODE; j++) treemap[j] = 0;
++			convert_treemap(ndest, org_treemap, treemap);
++			icount[0] = treemap[0];
++			for (j = 1; j <= ndest; j++) {
++				icount[j] = icount[j-1] + treemap[j];
++			}			
++		}
++	}
++	
++	IP6CB(skb)->xc6_branched++;
++	dests = rthx->addr;
++	hlim = IP6CB(skb)->xc6_hlim;
++	memcpy(bm, rthx->dmap,  sizeof(bm));
++
++	/*
++	 * check if the packet is in X2U-compatible format:
++	 *  <IP6|RTH|DSTHDR|UDP>
++	 */
++	memcpy(orig_bm, rthx->dmap, sizeof(orig_bm));
++	if (xcast6_x2u &&
++	    skb->nh.ipv6h->nexthdr == IPPROTO_ROUTING &&
++	    rthx->rt_hdr.nexthdr == IPPROTO_DSTOPTS && 
++	    (rthx->flags & XCAST6_F_DONTX2U) == 0) {
++		can_x2u = 1;
++	} else {
++		can_x2u = 0;
++	}
++
++	
++	rtt = kmalloc(sizeof(*rtt) * ndest, GFP_ATOMIC);
++	if (rtt == NULL) {
++		kfree_skb(skb);
++		goto bad;
++	}
++	memset(rtt, 0, sizeof(*rtt) * ndest);
++	memset(&fl, 0, sizeof(fl));
++	fl.fl6_src = skb->nh.ipv6h->saddr;
++	fl.iif = IP6CB(skb)->xc6_iif;
++
++	minmtu = 0;
++	i = 0;
++	while ((i = xcast6_bit_next(&bm, ndest, i)) < ndest) {
++		struct in6_addr *addr;
++		int type;
++		addr = &dests[i];
++		type = ipv6_addr_type(addr);
++        
++		if ((type & (IPV6_ADDR_MULTICAST|IPV6_ADDR_LINKLOCAL)) != 0) {
++			kfree_skb(skb);
++			goto bad;
++		} else if (type & IPV6_ADDR_SITELOCAL) {
++			/* deny site-local addresses */
++			kfree_skb(skb);
++			goto bad; 
++           	} else if ((type & IPV6_ADDR_LOOPBACK) != 0 && hlim >= 0) {
++			kfree_skb(skb);
++			goto bad;
++		}
++
++		fl.fl6_dst = *addr;
++		rtt[i] = (struct rt6_info *)ip6_route_output(NULL, &fl);
++		if (rtt[i] == NULL) {
++			xcast6_bit_clear(&bm, i);
++			xcast6_bit_clear(&orig_bm, i);
++		} else if ((rtt[i]->rt6i_flags & RTF_UP) == 0) {
++			xcast6_bit_clear(&bm, i);
++			dst_release(&rtt[i]->u.dst);
++			xcast6_bit_clear(&orig_bm, i);
++		} else {				
++			XCAST6_DPRINT("xcast6_branch: found route record\n");			
++			rests++;
++			if (minmtu == 0)
++				minmtu = dst_mtu(&rtt[i]->u.dst);
++			else if (minmtu > dst_mtu(&rtt[i]->u.dst))
++				minmtu = dst_mtu(&rtt[i]->u.dst);
++		}
++		i++;
++	}
++	if (rests == 0) {
++		kfree_skb(skb);
++		goto bad;
++	}
++	if (skb->len > minmtu) {
++		/* XXX notyet */
++		XCAST6_DPRINT("xcast6_branch: must send PKT_TOOBIG (notyet)\n");
++		kfree_skb(skb);
++		goto bad;
++	}
++	
++	i = branch = local = 0;
++
++	hostIndex = 0;
++	istart = 0;
++	memset(child_bm, 0, sizeof(child_bm));
++	
++	while (rests > 0) {
++		is_direct = 0;	
++		i = xcast6_bit_next(&orig_bm, ndest, i);
++		rests--;
++		if ((rtt[i]->u.dst.flags & DST_HOST) != 0) {
++			
++			if ((rtt[i]->rt6i_flags & RTF_NONEXTHOP) != 0) {				
++				local++;
++				hostIndex = i + 1; //the index of bitmap = index of treemap - 1 
++				istart = icount[hostIndex-1];
++				xcast6_bit_clear(&orig_bm, i);
++				goto nextbit;
++			} else {
++				/* delivery to the host on our link */
++				//notice to set right routing table
++				memset(nbm, 0, sizeof(nbm));
++				is_direct = 1;
++			}
++		} 
++		
++		acnt = 1;
++		if (is_direct)
++			goto forward;
++
++		if ((i >= istart) && (i < icount[hostIndex])) {
++			// found child node			
++			local++;			
++			find_subtree(treemap, &icount, &orig_bm, &child_bm, i, ndest);
++		}
++		goto nextbit;
++forward:
++		xcast6_bit_set(&nbm, i); 
++		xcast6_bit_clear(&orig_bm, i); 
++		nskb = xcast6_setup_skb(skb, *nhoffp, rthx, nbm, NULL,
++					rests + local);
++		if (nskb == NULL) {
++			goto nextbit;
++		} else if (can_x2u && acnt == 1) {
++			/* X2U needs to modify the UDP checksum.
++			 * Proceed h.raw to the UDP header. */
++			nskb->h.raw += (rthx->rt_hdr.hdrlen + 1) << 3;
++			xcast6_x2u_forward(nskb, rtt[i],
++				           (__u8 *)&dests[i] - skb->nh.raw);
++		} else {
++			/* Do not X2U on packets with multiple destinations. */
++			xcast6_forward(nskb, rtt[i],
++				       (__u8 *)&dests[i] - skb->nh.raw);
++		}
++#ifdef CONFIG_XCAST6_DEBUG
++		printk("---x2u forward-----\n");
++		for (t1 = 0; t1 < XCAST6_DMAP_LEN; t1++)
++			printk("%i ", nbm[t1]);
++		printk("\n");
++#endif
++
++nextbit:
++		dst_release(&rtt[i]->u.dst);
++		rtt[i] = NULL;
++		i++;
++	}
++	/*
++	 * after finding children node, bm must be set to mark remain
++	 * undelivered node for same level forwarding (in case there are
++	 * some (not all) xcast routers on end-to-end
++	 */
++
++	for (i = 0; i < ndest; i++) 
++	{
++		if (xcast6_bit_test(child_bm, i))
++			xcast6_bit_clear(orig_bm, i);
++	}
++	
++	i = xcast6_bit_next(orig_bm, ndest, 0);
++	if (i >= ndest) goto forward_to_childs;
++	memset(remain_bm, 0, sizeof(remain_bm));
++	for (j = 0; j < XCAST6_DMAP_LEN; j++) 
++		remain_bm[j] = orig_bm[j];
++	
++	nskb = xcast6_setup_skb(skb, *nhoffp, rthx, remain_bm, NULL, 1);
++
++	xcast6_forward(nskb, rtt[i], 
++					(__u8 *)&dests[i] - skb->nh.raw);
++	
++#ifdef CONFIG_XCAST6_DEBUG
++	printk("---same level forward------\n");
++	for (t2 = 0; t2 < XCAST6_DMAP_LEN; t2++)
++		printk("%i ", remain_bm[t2]);
++	printk("\n");
++#endif
++	
++forward_to_childs:
++	if (local > 0) {
++		if(!isXcastTreemap)
++			goto bad;
++		
++		// Find subtrees 
++		for(i = 0; i < treemap[hostIndex]; i++){
++			memset(branch_bm, 0, sizeof(branch_bm));
++			
++			find_subtree(treemap, &icount, &child_bm, 
++						&branch_bm, istart + i, ndest);	
++			
++			if (xcast6_bit_test(&branch_bm, istart + i))
++			{
++				struct in6_addr *addr;
++				addr = &dests[istart + i];
++				fl.fl6_dst = *addr;
++				rtt[istart + i] = (struct rt6_info *)ip6_route_output(NULL, &fl);										    
++				nskb = xcast6_setup_skb(skb, *nhoffp, rthx, branch_bm, NULL, 1);
++				if (nskb != NULL) {		
++					xcast6_forward(nskb, rtt[istart + i],
++						(__u8 *)&dests[istart + i] - skb->nh.raw);
++				}
++#ifdef CONFIG_XCAST6_DEBUG
++				printk("---child forward-----\n");
++				for (t3 = 0; t3 < XCAST6_DMAP_LEN; t3++)
++					printk("%i ", branch_bm[t3]);
++				printk("\n");
++#endif
++			}
++		}
++		struct inet6_skb_parm *opt = IP6CB(skb);
++		if (opt->xc6_icmp6nth >= 0)
++			opt->xc6_reflectable =
++				xcast6_bit_test(bm, opt->xc6_icmp6nth);
++		
++		ip6_route_input(skb);
++		skb->dev = skb->dst->dev;
++		opt->srcrt = skb->h.raw - skb->nh.raw;
++		skb->h.raw += (rthx->rt_hdr.hdrlen + 1) << 3;
++		opt->dst0 = opt->dst1;
++		opt->dst1 = 0;
++		*nhoffp = &rthx->rt_hdr.nexthdr - skb->nh.raw;
++		XCAST6_DPRINT("xcast6 local deliver: nxt=%d nhoff=%d\n",
++			      rthx->rt_hdr.nexthdr, *nhoffp);
++		if (opt->xc6_hlim == 0) {
++			/*
++			 * Hack for the loopback packets.
++			 * xc6_hlim == 0 indicates that this packet is
++			 * originated by us.
++			 */
++			IP6_INC_STATS_BH(ip6_dst_idev(skb->dst),
++					 IPSTATS_MIB_INRECEIVES);
++			ip6_xc_input(skb);
++		}
++	}
++	
++bad:
++	if (rtt != NULL) {
++		for (i = 0; i < ndest && rests > 0; i++) {
++			if (rtt[i] != NULL) {
++				dst_release(&rtt[i]->u.dst);
++				rests--;
++			}
++		}
++		kfree(rtt);
++	}
++	return ret;
++}
++#else
++
++int
++xcast6_branch(struct sk_buff *skb,
++	      struct rtx_hdr *rthx,
++	      unsigned int *nhoffp)
++{
++	/* notyet */
++
++	struct sk_buff *nskb;
++	struct in6_addr *dests;
++	struct flowi fl;
++	struct rt6_info **rtt;
++	__u8 bm[XCAST6_DMAP_LEN];
++	__u8 nbm[XCAST6_DMAP_LEN];
++	int hlim;
++	int i, j;
++	int rests = 0;
++	int branch, acnt;
++	int ndest;
++	int is_direct, local;
++	int can_x2u;
++	int minmtu;
++	int ret;
++	int (*issamef)(struct rt6_info *, struct rt6_info *);
++	
++	BUG_ON(rthx->rtx_type != IPV6_SRCRT_TYPE_XCAST6);
++
++	dst_release(skb->dst);
++	skb->dst = NULL;
++
++	ret = -1;
++	rtt = NULL;
++	ndest = rthx->ndest;
++	if(ndest < 1) {
++		XCAST6_DPRINT("xcast6_branch: ndest(%d) < 1\n", ndest);
++		kfree_skb(skb);
++		goto bad;
++	}
++
++	if (IP6CB(skb)->xc6_icmp6nth >= ndest) {
++		XCAST6_DPRINT("xcast6_branch: icmp6nth(%d) > ndest(%d)\n",
++			      IP6CB(skb)->xc6_icmp6nth, ndest);
++		kfree_skb(skb);
++		goto bad;
++	}
++	if (xcast6_rthdrlen(rthx->ndest) != (rthx->rt_hdr.hdrlen + 1) << 3) {
++		XCAST6_DPRINT("xcast6_branch: invalid packet length\n");
++		kfree_skb(skb);
++		goto bad;
++	}
++
++	XCAST6_DPRINT("xcast6_branch: nhoff=%d\n", *nhoffp);
++
++	IP6CB(skb)->xc6_branched++;
++	dests = rthx->addr;
++	hlim = IP6CB(skb)->xc6_hlim;
++	
++	memcpy(bm, rthx->dmap,  sizeof(bm));
++
++	/*
++	 * check if the packet is in X2U-compatible format:
++	 *  <IP6|RTH|UDP>
++	 */
++	if (xcast6_x2u &&
++	    skb->nh.ipv6h->nexthdr == IPPROTO_ROUTING &&
++	    rthx->rt_hdr.nexthdr == IPPROTO_UDP &&
++	    (rthx->flags & XCAST6_F_DONTX2U) == 0) {
++		can_x2u = 1;
++	} else {
++		can_x2u = 0;
++	}
++
++	rtt = kmalloc(sizeof(*rtt) * ndest, GFP_ATOMIC);
++	if (rtt == NULL) {
++		kfree_skb(skb);
++		goto bad;
++	}
++	memset(rtt, 0, sizeof(*rtt) * ndest);
++	memset(&fl, 0, sizeof(fl));
++	fl.fl6_src = skb->nh.ipv6h->saddr;
++	fl.iif = IP6CB(skb)->xc6_iif;
++
++	minmtu = 0;
++	i = 0;
++	while ((i = xcast6_bit_next(bm, ndest, i)) < ndest) {
++		struct in6_addr *addr;
++		int type;
++		
++		addr = &dests[i];
++		type = ipv6_addr_type(addr);
++        
++		if ((type & (IPV6_ADDR_MULTICAST|IPV6_ADDR_LINKLOCAL)) != 0) {
++			kfree_skb(skb);
++			goto bad;
++		} else if (type & IPV6_ADDR_SITELOCAL) {
++			/* deny site-local addresses */
++			kfree_skb(skb);
++			goto bad; 
++           	} else if ((type & IPV6_ADDR_LOOPBACK) != 0 && hlim >= 0) {
++			kfree_skb(skb);
++			goto bad;
++		}
++
++		fl.fl6_dst = *addr;
++		rtt[i] = (struct rt6_info *)ip6_route_output(NULL, &fl);
++		if (rtt[i] == NULL) {
++			xcast6_bit_clear(bm, i);
++		} else if ((rtt[i]->rt6i_flags & RTF_UP) == 0) {
++			xcast6_bit_clear(bm, i);
++			dst_release(&rtt[i]->u.dst);
++		} else {
++			XCAST6_DPRINT("xcast6_branch: found route record\n");
++			XCAST6_DPRINT("dst=" NIP6_FMT 
++				      " src=" NIP6_FMT
++				      " rt6i_flags=%x\n",
++				      NIP6(*addr),
++				      NIP6(skb->nh.ipv6h->saddr),
++				      rtt[i]->rt6i_flags);
++			rests++;
++			if (minmtu == 0)
++				minmtu = dst_mtu(&rtt[i]->u.dst);
++			else if (minmtu > dst_mtu(&rtt[i]->u.dst))
++				minmtu = dst_mtu(&rtt[i]->u.dst);
++		}
++		i++;
++	}
++
++	if (rests == 0) {
++		kfree_skb(skb);
++		goto bad;
++	}
++
++	if (skb->len > minmtu) {
++		/* XXX notyet */
++		XCAST6_DPRINT("xcast6_branch: must send PKT_TOOBIG (notyet)\n");
++		kfree_skb(skb);
++		goto bad;
++	}
++
++	is_direct = 0;
++	i = branch = local = 0;
++	while (rests > 0) {
++		i = xcast6_bit_next(bm, ndest, i);
++		memset(nbm, 0, sizeof(nbm));
++		rests--;
++
++		if ((rtt[i]->u.dst.flags & DST_HOST) != 0) {
++			if ((rtt[i]->rt6i_flags & RTF_NONEXTHOP) != 0) {
++				local++;
++				goto nextbit;
++			} else {
++				/* delivery to the host on our link */
++				is_direct = 1;
++			}
++		} 
++
++		xcast6_bit_set(nbm, i);
++		xcast6_bit_clear(bm, i);
++
++		acnt = 1;
++		if (is_direct)
++			goto forward;
++
++		if ((rtt[i]->rt6i_flags & RTF_GATEWAY) != 0)
++			issamef = xcast6_is_same_gateway;
++		else
++			issamef = xcast6_is_same_route;
++
++		j = i + 1;
++		while ((j = xcast6_bit_next(bm, ndest, j)) < ndest) {
++			if ((*issamef)(rtt[i], rtt[j])) {
++				xcast6_bit_clear(bm, j);
++				xcast6_bit_set(nbm, j);
++				dst_release(&rtt[j]->u.dst);
++				rtt[j] = NULL;
++				acnt++;
++				rests--;
++			}
++			j++;
++		}
++
++forward:
++		nskb = xcast6_setup_skb(skb, *nhoffp, rthx, nbm, NULL,
++					rests + local);
++		if (nskb == NULL) {
++			goto nextbit;
++		} else if (can_x2u && acnt == 1) {
++			/* X2U needs to modify the UDP checksum.
++			 * Proceed h.raw to the UDP header. */
++			nskb->h.raw += (rthx->rt_hdr.hdrlen + 1) << 3;
++			xcast6_x2u_forward(nskb, rtt[i],
++				           (__u8 *)&dests[i] - skb->nh.raw);
++		} else {
++			/* Do not X2U on packets with multiple destinations. */
++			xcast6_forward(nskb, rtt[i],
++				       (__u8 *)&dests[i] - skb->nh.raw);
++		}
++
++nextbit:
++		dst_release(&rtt[i]->u.dst);
++		rtt[i] = NULL;
++		i++;
++	}
++
++	if (local > 0) {
++		struct inet6_skb_parm *opt = IP6CB(skb);
++
++		if (opt->xc6_icmp6nth >= 0)
++			opt->xc6_reflectable =
++				xcast6_bit_test(bm, opt->xc6_icmp6nth);
++
++		ip6_route_input(skb);
++		skb->dev = skb->dst->dev;
++		opt->srcrt = skb->h.raw - skb->nh.raw;
++		skb->h.raw += (rthx->rt_hdr.hdrlen + 1) << 3;
++		opt->dst0 = opt->dst1;
++		opt->dst1 = 0;
++		*nhoffp = &rthx->rt_hdr.nexthdr - skb->nh.raw;
++		XCAST6_DPRINT("xcast6 local deliver: nxt=%d nhoff=%d\n",
++			      rthx->rt_hdr.nexthdr, *nhoffp);
++		if (opt->xc6_hlim == 0) {
++			/*
++			 * Hack for the loopback packets.
++			 * xc6_hlim == 0 indicates that this packet is
++			 * originated by us.
++			 */
++			IP6_INC_STATS_BH(ip6_dst_idev(skb->dst),
++					 IPSTATS_MIB_INRECEIVES);
++			ip6_xc_input(skb);
++		}
++	}
++bad:
++	if (rtt != NULL) {
++		for (i = 0; i < ndest && rests > 0; i++) {
++			if (rtt[i] != NULL) {
++				dst_release(&rtt[i]->u.dst);
++				rests--;
++			}
++		}
++		kfree(rtt);
++	}
++	return ret;
++}
++
++#endif
++static struct sk_buff *
++xcast6_setup_skb(struct sk_buff *skb,
++		 int nhoff,
++		 struct rtx_hdr *orthx,
++		 __u8 *bm,
++		 struct in6_addr *dests,
++		 int need_copy)
++{
++	struct sk_buff *nskb;
++	struct rtx_hdr *nrthx;
++
++	if (!need_copy) {
++		nskb = skb;
++		nrthx = orthx;
++	} else {
++		nskb = skb_copy(skb, GFP_ATOMIC);
++		if (nskb == NULL)
++			return NULL;
++
++		nrthx = (struct rtx_hdr *)(nskb->nh.raw + 
++					   ((__u8 *)orthx - skb->nh.raw));
++	}
++
++	if (IP6CB(nskb)->xc6_icmp6nth >= 0)
++		IP6CB(nskb)->xc6_reflectable =
++			xcast6_bit_test(bm, IP6CB(nskb)->xc6_icmp6nth);
++
++	memcpy(nrthx->dmap, bm, sizeof(nrthx->dmap));
++	if (dests != NULL)
++		memcpy(nrthx->addr, dests, sizeof(*dests) * nrthx->ndest);
++
++	return nskb;
++}
++
++static int
++xcast6_forward(struct sk_buff *skb,
++	       struct rt6_info *rt6i,
++	       int daddroff)
++{
++	if (IP6CB(skb)->xc6_hlim == 0) {
++		/* The packet is sent by us. */
++//		IP6CB(skb)->xc6_hlim = skb->nh.ipv6h->hop_limit; //hop_limit = 0 here ???
++		IP6CB(skb)->xc6_hlim = 64; //modify to add hoplimit = 64--> should be revise
++	} else if (IP6CB(skb)->xc6_hlim == 1) {
++		/* XXX need to process for ICMP6 Error time exceeded */
++		kfree_skb(skb);
++		return -1;
++	} else {
++		IP6CB(skb)->xc6_hlim -= 1;
++	}
++
++	/* Always reset inner hoplimit to 1. */
++	skb->nh.ipv6h->hop_limit = 1;
++	ip6_route_input(skb);
++	skb->dev = skb->dst->dev;
++	IP6CB(skb)->xc6_raddroff = daddroff;
++	/* push back the header */
++	skb_push(skb, skb->data - skb->nh.raw);
++
++	return NF_HOOK(PF_INET6, NF_IP6_POST_ROUTING, skb, NULL, skb->dev,
++		       dst_output);
++}
++
++#include <linux/udp.h>
++#include <net/checksum.h>
++
++static int
++xcast6_x2u_forward(struct sk_buff *skb,
++		   struct rt6_info *rt6i,
++		   int daddroff)
++{
++	struct ipv6hdr ip6;
++	struct in6_addr *daddr;
++	struct udphdr *uh;
++	unsigned int sum;
++
++	if (IP6CB(skb)->xc6_hlim == 1) {
++		/* XXX need to process for ICMP6 Error time exceeded */
++		kfree_skb(skb);
++		return -1;
++	}
++
++	if (!pskb_may_pull(skb, sizeof(*uh))) {
++		kfree_skb(skb);
++		return -1;
++	}
++
++	uh = skb->h.uh;
++
++	daddr = (struct in6_addr *)(skb->nh.raw + daddroff);
++	ip6 = *skb->nh.ipv6h;
++	sum = csum_partial(daddr, sizeof(*daddr), ~csum_unfold(uh->check));
++	sum = csum_sub(sum, csum_partial(&ip6.daddr, sizeof(ip6.daddr), 0));
++	ip6.daddr = *daddr;
++	uh->check = csum_fold(sum);
++	if (IP6CB(skb)->xc6_hlim > 1)
++		ip6.hop_limit = IP6CB(skb)->xc6_hlim - 1;
++
++	ip6.nexthdr = IPPROTO_UDP;
++	ip6.payload_len = uh->len;
++
++	if (skb->ip_summed == CHECKSUM_COMPLETE)
++		skb->ip_summed = CHECKSUM_NONE;
++
++	if (!pskb_pull(skb, skb->h.raw - skb->data)) {
++		kfree_skb(skb);
++		return -1;
++	}
++
++	skb->nh.raw = skb_push(skb, sizeof(ip6));
++	skb->h.raw = skb->nh.raw;
++	*skb->nh.ipv6h = ip6;
++	skb->dst = dst_clone(&rt6i->u.dst);
++	skb->dev = skb->dst->dev;
++
++	return NF_HOOK(PF_INET6, NF_IP6_POST_ROUTING, skb, NULL, skb->dev,
++		       dst_output);
++}
++
++static int
++xcast6_is_same_gateway(struct rt6_info *r1, struct rt6_info *r2)
++{
++	if ((r1->rt6i_flags & RTF_GATEWAY) == 0)
++		return 0;
++
++	if ((r2->rt6i_flags & RTF_GATEWAY) == 0)
++		return 0;
++
++	return !ipv6_addr_cmp(&r1->rt6i_gateway, &r2->rt6i_gateway);
++}
++
++static int
++xcast6_is_same_route(struct rt6_info *r1, struct rt6_info *r2)
++{
++	return r1 == r2;
++}
++
++#if defined(CONFIG_SYSCTL)
++
++ctl_table ipv6_xcast6_table[] = {
++	{
++			.ctl_name       = NET_IPV6_XCAST6_ENABLE,
++			.procname       = "enable",
++			.data           = &xcast6_enable, 
++			.maxlen         = sizeof(int), 
++			.mode           = 0644,
++			.proc_handler   = &proc_dointvec
++	},
++#ifdef CONFIG_XCAST6_DEBUG
++	{
++			.ctl_name       = NET_IPV6_XCAST6_DEBUG,
++			.procname       = "debug",
++			.data           = &xcast6_debug, 
++			.maxlen         = sizeof(int), 
++			.mode           = 0644,
++			.proc_handler   = &proc_dointvec
++	},
++#endif
++	{
++			.ctl_name       = NET_IPV6_XCAST6_X2U, 
++			.procname      = "x2u",
++			.data           = &xcast6_x2u, 
++			.maxlen         = sizeof(int), 
++			.mode           = 0644,
++			.proc_handler   = &proc_dointvec
++	},
++	 { .ctl_name = 0 }
++};
++
++#endif
++
++static char digits[] = "0123456789abcdef";
++static int ip6round = 0;
++static char *
++ip6_sprintf(const struct in6_addr *addr)
++{
++	static char ip6buf[8][48];
++	int i;
++	char *cp;
++	const u_short *a = (u_short *)addr;
++	const u_char *d;
++	int dcolon = 0;
++
++	ip6round = (ip6round + 1) & 7;
++	cp = ip6buf[ip6round];
++
++	for (i = 0; i < 8; i++) {
++		if (dcolon == 1) {
++			if (*a == 0) {
++				if (i == 7)
++					*cp++ = ':';
++				a++;
++				continue;
++			} else
++				dcolon = 2;
++		}
++		if (*a == 0) {
++			if (dcolon == 0 && *(a + 1) == 0) {
++				if (i == 0)
++					*cp++ = ':';
++				*cp++ = ':';
++				dcolon = 1;
++			} else {
++				*cp++ = '0';
++				*cp++ = ':';
++			}
++			a++;
++			continue;
++		}
++		d = (const u_char *)a;
++		*cp++ = digits[*d >> 4];
++		*cp++ = digits[*d++ & 0xf];
++		*cp++ = digits[*d >> 4];
++		*cp++ = digits[*d & 0xf];
++		*cp++ = ':';
++		a++;
++	}
++	*--cp = 0;
++	return(ip6buf[ip6round]);
++}
+diff -NurP linux-2.6.21/net/ipv6/xcast6_core.c linux-2.6.21-treemap/net/ipv6/xcast6_core.c
+--- linux-2.6.21/net/ipv6/xcast6_core.c	1970-01-01 07:00:00.000000000 +0700
++++ linux-2.6.21-treemap/net/ipv6/xcast6_core.c	2009-04-02 07:38:40.000000000 +0700
+@@ -0,0 +1,5 @@
++#include <net/ipv6.h>
++#include <net/xcast6.h>
++
++struct in6_addr xcast6_all_nodes = IN6ADDR_ALLXCASTNODES_INIT;
++EXPORT_SYMBOL(xcast6_all_nodes);
