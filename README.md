@@ -1,5 +1,6 @@
 # Xcast6 Treemap overview
 Xcast6 Treemap is a new multicast protocol designed for IPv6. More information about Xcast can be found in:
+- (Slides at Cambridge NetFPGA summit 2017) https://www.ee.ucl.ac.uk/~uceetkp/Xcast_NetFPGA.ppt
 - (slides at Coseners 2016) http://coseners.net/wp-content/uploads/2015/07/KhoaPhan_Xcast_UCL.pdf
 - (poster at CoNEXT 2012) http://hal.inria.fr/docs/00/74/92/66/PDF/stud16-phan.pdf
 - (paper at CCNC 2010) ftp://ftp-sop.inria.fr/members/Truong_Khoa.Phan/CCNC10_Phan_Xcast6Treemap.pdf
